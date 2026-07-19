@@ -33,45 +33,52 @@ with tab_sophia:
         st.info("Módulo Sophia em pausa técnica.")
 
 with tab_conta_azul:
-    st.title("Conciliação Conta Azul")
+    st.header("Conexão Conta Azul")
 
+    # 1. Captura de forma segura
     params = st.query_params
     code = params.get("code")
 
-    if not code:
-        # URL de autorização para o botão
-        auth_url = f"https://api.contaazul.com/auth/authorize?client_id={CLIENT_ID}&redirect_uri={REDIRECT_URI}&response_type=code&scope=accounting"
-        st.markdown(f"[Conectar com Conta Azul]({auth_url})")
-    else:
-        st.write("Código recebido! Trocando por token...")
-        
-        # 3. Troca do Code pelo Token
-        data = {
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": REDIRECT_URI
-        }
-        
-        # Auth via Basic (exemplo comum, verifique se a Conta Azul exige header ou body)
-        response = requests.post(
-            "https://api.contaazul.com/oauth2/token",
-            data=data,
-            auth=(CLIENT_ID, CLIENT_SECRET)
-        )
-        
-        if response.status_code == 200:
-            tokens = response.json()
-            st.success("Conectado com sucesso!")
-            st.session_state["access_token"] = tokens.get("access_token")
-            # Limpa a URL para sumir o code
-            st.query_params.clear()
-        else:
-            st.error(f"Erro: {response.text}")
+    if code and "access_token" not in st.session_state:
+        with st.spinner("Trocando código por token..."):
+            data = {
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": "https://conciliacao-m6hfug34equljwalpu5xb4.streamlit.app/",
+            }
+            
+            # Conta Azul espera as credenciais via Basic Auth
+            response = requests.post(
+                "https://api.contaazul.com/oauth2/token",
+                data=data,
+                auth=(CLIENT_ID, CLIENT_SECRET)
+            )
+            
+            if response.status_code == 200:
+                tokens = response.json()
+                st.session_state["access_token"] = tokens.get("access_token")
+                st.session_state["refresh_token"] = tokens.get("refresh_token")
+                
+                # A mágica para não quebrar: recarregar sem o parâmetro 'code' na URL
+                st.query_params.clear()
+                st.rerun() 
+            else:
+                st.error(f"Erro na autenticação: {response.status_code}")
+                st.text(response.text)
 
-    # 4. Exibição de Dados (Se tiver token)
+    # 2. Exibição do estado
     if "access_token" in st.session_state:
-        st.write("Token ativo! Agora é só chamar o endpoint:")
-        # Exemplo: headers = {"Authorization": f"Bearer {st.session_state['access_token']}"}
+        st.success("Conectado com sucesso!")
+        with st.expander("Dados de Debug (Token)"):
+            st.write("Access Token:", st.session_state["access_token"])
+            if "refresh_token" in st.session_state:
+                st.write("Refresh Token:", st.session_state["refresh_token"])
+        
+        st.write("Token ativo. Pronto para realizar requisições.")
+    else:
+        # Botão mantido apenas se não estiver logado
+        auth_url = f"https://api.contaazul.com/auth/authorize?client_id={CLIENT_ID}&redirect_uri=https://conciliacao-m6hfug34equljwalpu5xb4.streamlit.app/&response_type=code&scope=accounting"
+        st.markdown(f'<a href="{auth_url}" target="_self">Clique aqui para conectar com Conta Azul</a>', unsafe_allow_html=True)
 
 with tab_conciliacao:
     st.header("Processar Conciliação")
