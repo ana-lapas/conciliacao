@@ -220,3 +220,4 @@ documentos_recebidos/*
 __pycache__/
 *.log
 .pytest_cache/
+.streamlit/
