@@ -77,7 +77,7 @@ with tab_conta_azul:
         st.write("Token ativo. Pronto para realizar requisições.")
     else:
         # Botão mantido apenas se não estiver logado
-        auth_url = f"https://api.contaazul.com/auth/authorize?client_id={CLIENT_ID}&redirect_uri=https://conciliacao-m6hfug34equljwalpu5xb4.streamlit.app/&response_type=code&scope=accounting"
+        auth_url = f"https://api.contaazul.com/auth/authorize?client_id={CLIENT_ID}&redirect_uri=https://conciliacao-m6hfug34equljwalpu5xb4.streamlit.app&response_type=code&scope=accounting"
         st.markdown(f'<a href="{auth_url}" target="_self">Clique aqui para conectar com Conta Azul</a>', unsafe_allow_html=True)
 
 with tab_conciliacao:
