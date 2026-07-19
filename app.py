@@ -45,13 +45,14 @@ with tab_conta_azul:
                 "grant_type": "authorization_code",
                 "code": code,
                 "redirect_uri": "https://conciliacao-m6hfug34equljwalpu5xb4.streamlit.app/",
+                "client_id": CLIENT_ID,          # Enviando no corpo
+                "client_secret": CLIENT_SECRET   # Enviando no corpo
             }
-            
-            # Conta Azul espera as credenciais via Basic Auth
+
+            # Tente sem o parâmetro 'auth=' primeiro
             response = requests.post(
                 "https://api.contaazul.com/oauth2/token",
-                data=data,
-                auth=(CLIENT_ID, CLIENT_SECRET)
+                data=data
             )
             
             if response.status_code == 200:
