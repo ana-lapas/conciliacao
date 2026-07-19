@@ -12,7 +12,7 @@ usuario = st.secrets["SOFIA_USUARIO"]
 senha = st.secrets["SOFIA_SENHA"]
 CLIENT_ID = st.secrets["CLIENT_ID"]
 CLIENT_SECRET = st.secrets["CLIENT_SECRET"]
-REDIRECT_URI = "https://SEU_APP.streamlit.app/" 
+REDIRECT_URI = st.secrets["REDIRECT_URI"]
 
 api = SofiaAPI(base_url, tenant, usuario, senha)
 
