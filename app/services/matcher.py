@@ -23,7 +23,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.services.sofia_api import SofiaAPI
-from app.services.cache_sync import SessionLocal  # reutiliza a fábrica de sessões
+from app.services.cache_sync import SessionLocal 
 
 logger = logging.getLogger(__name__)
 

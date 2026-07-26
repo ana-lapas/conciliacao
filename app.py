@@ -3,15 +3,16 @@ import streamlit as st
 import pandas as pd
 import os
 import tempfile
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 from sqlalchemy import create_engine, text
 
 from app.services.sofia_api import SofiaAPI
 from app.services.remessa_sync import sincronizar_remessa
 from app.services.retorno_sync import sincronizar_retorno
 from app.services.matcher import conciliar_retorno
+from app.services.conta_azul import get_authorization_url, exchange_code, get_credentials
 
-load_dotenv()
+load_dotenv(find_dotenv())
 
 st.set_page_config(page_title="Conciliação Financeira", layout="wide")
 st.title("🔄 Conciliação Financeira Escolar")
@@ -20,22 +21,24 @@ st.title("🔄 Conciliação Financeira Escolar")
 DATABASE_URL = os.getenv("DATABASE_URL")
 engine = create_engine(DATABASE_URL)
 
-# =============================================================================
+# -----------------------------------------------------------------------------
 # Abas
-# =============================================================================
-tab1, tab2 = st.tabs(["📂 Processar Arquivos", "🔍 Revisão Manual"])
+# -----------------------------------------------------------------------------
+tab1, tab2, tab3 = st.tabs([
+    "📂 Processar Arquivos",
+    "🔍 Revisão Manual",
+    "💳 Conta Azul"
+])
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Aba 1: Upload e Conciliação Automática
-# -----------------------------------------------------------------------------
-# app.py (trecho da Aba 1)
+# =============================================================================
 with tab1:
     st.header("Upload e Conciliação")
 
-    # Escolha do diretório de trabalho
     pasta_destino = st.text_input(
         "Pasta para salvar os arquivos (caminho completo no computador):",
-        value=os.path.expanduser("~/documentos_recebidos")  # sugestão padrão
+        value=os.path.expanduser("~/documentos_recebidos")
     )
 
     col1, col2 = st.columns(2)
@@ -60,18 +63,14 @@ with tab1:
         elif not pasta_destino.strip():
             st.error("Informe uma pasta de destino.")
         else:
-            # Cria a pasta, se não existir
             try:
                 os.makedirs(pasta_destino, exist_ok=True)
             except Exception as e:
                 st.error(f"Não foi possível criar/acessar a pasta: {e}")
                 st.stop()
 
-            # Lista para armazenar os caminhos completos dos arquivos salvos
             arquivos_salvos = []
-
             try:
-                # 1. Salvar e processar cada retorno
                 with st.spinner("Salvando e importando retorno(s)..."):
                     for ret_file in ret_files:
                         caminho = os.path.join(pasta_destino, ret_file.name)
@@ -81,7 +80,6 @@ with tab1:
                         sincronizar_retorno(caminho)
                     st.success(f"{len(ret_files)} arquivo(s) de retorno importado(s).")
 
-                # 2. Salvar e processar cada remessa (se houver)
                 if rem_files:
                     with st.spinner("Salvando e importando remessa(s)..."):
                         for rem_file in rem_files:
@@ -92,7 +90,6 @@ with tab1:
                             sincronizar_remessa(caminho)
                         st.success(f"{len(rem_files)} arquivo(s) de remessa importado(s).")
 
-                # 3. Conciliação automática
                 with st.spinner("Executando conciliação automática..."):
                     api = SofiaAPI(
                         os.getenv("SOFIA_BASE_URL"),
@@ -104,19 +101,13 @@ with tab1:
                     conciliar_retorno(api)
                     st.success("Conciliação concluída! Verifique a aba de Revisão Manual.")
 
-                # Informa onde os arquivos foram salvos
                 st.info(f"📁 Arquivos salvos em: {pasta_destino}")
-
             except Exception as e:
                 st.error(f"Erro durante o processamento: {e}")
-                # Opcional: remover arquivos que foram salvos em caso de erro crítico?
-                # for caminho in arquivos_salvos:
-                #     try:
-                #         os.unlink(caminho)
-                #     except: pass
-# -----------------------------------------------------------------------------
-# Aba 2: Revisão Manual de Pendentes
-# -----------------------------------------------------------------------------
+
+# =============================================================================
+# Aba 2: Revisão Manual
+# =============================================================================
 with tab2:
     st.header("Pagamentos Pendentes de Revisão")
 
@@ -133,7 +124,7 @@ with tab2:
 
     if pendentes:
         df = pd.DataFrame(pendentes, columns=["ID", "Retorno ID", "Nosso Número", "Nome Atual", "Valor Pago", "Data Pagamento", "Mensagem"])
-        st.dataframe(df, use_container_width=True)
+        st.dataframe(df, width='stretch')
 
         st.subheader("Editar Pagamento")
         selected_id = st.selectbox("Selecione o ID do registro:", df["ID"].tolist())
@@ -155,3 +146,41 @@ with tab2:
                 st.experimental_rerun()
     else:
         st.info("Nenhum pagamento pendente de revisão.")
+
+# =============================================================================
+# Aba 3: Conta Azul (conexão OAuth)
+# =============================================================================
+with tab3:
+    st.header("Conexão Conta Azul")
+
+    # Capturar code da URL (callback)
+    params = st.query_params
+    code = params.get("code", None)
+    state = params.get("state", None)
+
+    if code:
+        with st.spinner("Autorizando..."):
+            try:
+                if "oauth_state" not in st.session_state or state != st.session_state["oauth_state"]:
+                    st.error("Falha de segurança: state inválido.")
+                else:
+                    exchange_code(code, state)
+                    st.success("Autorizado com sucesso!")
+                    # Remove apenas os parâmetros de autenticação
+                    new_params = {k: v for k, v in st.query_params.items() if k not in ("code", "state")}
+                    st.query_params.clear()
+                    st.query_params.update(new_params)
+                    st.rerun()
+            except Exception as e:
+                st.error(f"Erro na autorização: {e}")
+                st.exception(e)
+
+    # Verificar se já está conectado
+    creds = get_credentials()
+    if creds and creds.get("access_token"):
+        st.success(f"Conectado! Token válido até {creds['expires_at'].strftime('%d/%m/%Y %H:%M')}")
+        # Futuramente: opção de exportar via API ou gerar lote
+    else:
+        auth_url, state = get_authorization_url()
+        st.session_state["oauth_state"] = state
+        st.markdown(f'<a href="{auth_url}" target="_self">Clique aqui para conectar com Conta Azul</a>', unsafe_allow_html=True)
