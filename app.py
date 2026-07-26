@@ -24,9 +24,10 @@ engine = create_engine(DATABASE_URL)
 # -----------------------------------------------------------------------------
 # Abas
 # -----------------------------------------------------------------------------
-tab1, tab2, tab3 = st.tabs([
+tab1, tab2, tab3, tab4 = st.tabs([
     "📂 Processar Arquivos",
     "🔍 Revisão Manual",
+    "📋 Conciliações Prontas",
     "💳 Conta Azul"
 ])
 
@@ -146,11 +147,66 @@ with tab2:
                 st.experimental_rerun()
     else:
         st.info("Nenhum pagamento pendente de revisão.")
-
 # =============================================================================
-# Aba 3: Conta Azul (conexão OAuth)
+# Aba 3: Conciliações Prontas (revisão final e exportação)
 # =============================================================================
 with tab3:
+    st.header("Pagamentos Conciliados (Prontos para Exportação)")
+
+    with engine.connect() as conn:
+        conciliados = conn.execute(
+            text("""
+                SELECT pm.id, pm.retorno_id, r.nosso_numero, pm.nome_responsavel,
+                       pm.cpf_responsavel, pm.valor_pago, pm.data_pagamento,
+                       pm.data_vencimento, pm.mensagem
+                FROM payment_match pm
+                JOIN retorno r ON r.id = pm.retorno_id
+                WHERE pm.status = 'CONCILIADO'
+            """)
+        ).fetchall()
+
+    if conciliados:
+        df_conciliados = pd.DataFrame(
+            conciliados,
+            columns=["ID", "Retorno ID", "Nosso Número", "Nome Responsável",
+                     "CPF", "Valor Pago", "Data Pagamento", "Vencimento", "Mensagem"]
+        )
+        st.dataframe(df_conciliados, width='stretch')
+
+        st.subheader("Ações")
+        col1, col2 = st.columns(2)
+
+        with col1:
+            selected_id = st.selectbox("Selecione um registro para reabrir:", df_conciliados["ID"].tolist())
+            if st.button("Reabrir Registro (voltar para Revisão)"):
+                with engine.begin() as conn:
+                    conn.execute(
+                        text("UPDATE payment_match SET status = 'PENDENTE_REVISAO' WHERE id = :id"),
+                        {"id": selected_id}
+                    )
+                    conn.execute(
+                        text("UPDATE retorno SET status = 'PENDENTE_REVISAO' WHERE id = :rid"),
+                        {"rid": int(df_conciliados[df_conciliados["ID"] == selected_id]["Retorno ID"].iloc[0])}
+                    )
+                st.success("Registro reaberto para revisão.")
+                st.experimental_rerun()
+
+        with col2:
+            if st.button("Exportar CSV (todos os conciliados)"):
+                csv = df_conciliados.to_csv(index=False, sep=";")
+                st.download_button(
+                    label="Baixar CSV",
+                    data=csv,
+                    file_name="conciliações_prontas.csv",
+                    mime="text/csv"
+                )
+    else:
+        st.info("Nenhum pagamento conciliado no momento.")
+
+# =============================================================================
+# Aba 4: Conta Azul (conexão OAuth)
+# =============================================================================
+with tab4:
     st.header("Conexão Conta Azul")
 
     # Capturar code da URL (callback)
@@ -183,4 +239,4 @@ with tab3:
     else:
         auth_url, state = get_authorization_url()
         st.session_state["oauth_state"] = state
-        st.markdown(f'<a href="{auth_url}" target="_self">Clique aqui para conectar com Conta Azul</a>', unsafe_allow_html=True)
+        st.link_button("Conectar com Conta Azul", url=auth_url)
