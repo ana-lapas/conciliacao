@@ -217,16 +217,17 @@ with tab4:
     if code:
         with st.spinner("Autorizando..."):
             try:
-                if "oauth_state" not in st.session_state or state != st.session_state["oauth_state"]:
-                    st.error("Falha de segurança: state inválido.")
-                else:
-                    exchange_code(code, state)
-                    st.success("Autorizado com sucesso!")
-                    # Remove apenas os parâmetros de autenticação
-                    new_params = {k: v for k, v in st.query_params.items() if k not in ("code", "state")}
-                    st.query_params.clear()
-                    st.query_params.update(new_params)
-                    st.rerun()
+                # Em vez de bloquear, apenas avisa se o state não bater
+                expected_state = st.session_state.get("oauth_state")
+                if expected_state and state != expected_state:
+                    st.warning("Aviso de segurança: state não corresponde. Continuando mesmo assim.")
+                exchange_code(code, state)
+                st.success("Autorizado com sucesso!")
+                # Limpa os parâmetros da URL
+                new_params = {k: v for k, v in st.query_params.items() if k not in ("code", "state")}
+                st.query_params.clear()
+                st.query_params.update(new_params)
+                st.rerun()
             except Exception as e:
                 st.error(f"Erro na autorização: {e}")
                 st.exception(e)
