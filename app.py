@@ -144,7 +144,7 @@ with tab2:
                         {"rid": int(row["Retorno ID"])}
                     )
                 st.success("Pagamento aprovado! Agora ele está CONCILIADO.")
-                st.experimental_rerun()
+                st.rerun()
     else:
         st.info("Nenhum pagamento pendente de revisão.")
 # =============================================================================
@@ -189,7 +189,7 @@ with tab3:
                         {"rid": int(df_conciliados[df_conciliados["ID"] == selected_id]["Retorno ID"].iloc[0])}
                     )
                 st.success("Registro reaberto para revisão.")
-                st.experimental_rerun()
+                st.rerun()
 
         with col2:
             if st.button("Exportar CSV (todos os conciliados)"):
