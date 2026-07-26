@@ -1,5 +1,6 @@
 import logging
 from datetime import datetime
+from app.services.remessa_reader import RemessaReader
 
 # Configuração do Logger
 logging.basicConfig(
@@ -49,13 +50,14 @@ class RetornoReader:
             valor_pago = float(linha[253:266]) / 100 # Posições 254-266
             data_ocorrencia = linha[110:116] # Posições 111-116
             codigo_ocorrencia = linha[108:110] # Posições 109-110
-            
+            nome_pagador = linha[234:274].strip()
             self.registros.append({
                 'linha': num_linha,
                 'nosso_numero': nosso_numero,
                 'valor': valor_pago,
                 'data': datetime.strptime(data_ocorrencia, '%d%m%y').strftime('%Y-%m-%d'),
-                'ocorrencia': codigo_ocorrencia
+                'ocorrencia': codigo_ocorrencia,
+                'nome_pagador': nome_pagador
             })
             
             logger.debug(f"Linha {num_linha} OK: N/N {nosso_numero} | Valor: {valor_pago}")

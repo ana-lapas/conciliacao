@@ -1,5 +1,5 @@
 # tests/test_reader.py
-from utils.reader import RemessaReader
+from app.services.remessa_reader import RemessaReader
 import pytest
 
 def test_extrair_campo():

@@ -1,4 +1,4 @@
-from utils.reader import RemessaReader
+from app.services.remessa_reader import RemessaReader
 
 # Coloque o caminho do seu arquivo .rem aqui
 caminho = "documentos_recebidos/Remessa25667 (1).rem" 

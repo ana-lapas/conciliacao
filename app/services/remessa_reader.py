@@ -13,9 +13,11 @@ class RemessaReader:
     """
     
     LAYOUT = {
+        "nosso_numero": (71, 82),
         "valor_titulo": (126, 139),
         "data_vencimento": (120, 126),
         "nome_pagador": (234, 274),
+        "cpf_pagador": (220, 234),
     }
 
     def __init__(self, file_path):
@@ -54,15 +56,18 @@ class RemessaReader:
     def _processar_registro_tipo_1(self, linha, num_linha):
         """Processa e valida internamente um registro do tipo 1."""
         try:
+            nosso_numero = self._extrair_campo(linha, *self.LAYOUT["nosso_numero"])
             valor_raw = self._extrair_campo(linha, *self.LAYOUT["valor_titulo"])
             valor_processado = float(valor_raw) / 100
             data_raw = self._extrair_campo(linha, *self.LAYOUT["data_vencimento"])
             data_formatada = datetime.strptime(data_raw, '%d%m%y').strftime('%Y-%m-%d')
             
             registro = {
+                "nosso_numero": nosso_numero,
                 "nome_pagador": self._extrair_campo(linha, *self.LAYOUT["nome_pagador"]),
                 "valor": valor_processado,
-                "vencimento": data_formatada
+                "vencimento": data_formatada,
+                "status": "PENDENTE_REGISTRO"
             }
             self.registros.append(registro)
             
@@ -73,3 +78,10 @@ class RemessaReader:
             msg_erro = f"Linha {num_linha}: Erro ao converter valor '{valor_raw}'."
             logging.warning(msg_erro) # Log como aviso
             self.erros.append(msg_erro)
+            
+    def carregar_remessa(caminho_rem):
+        if not caminho_rem:
+            return {}
+        reader = RemessaReader(caminho_rem)
+        reader.processar()
+        return {reg['nosso_numero']: reg for reg in reader.registros}

@@ -1,5 +1,5 @@
 # test_api.py
-from utils.sofia_api import SofiaAPI
+from app.services.sofia_api import SofiaAPI
 import os
 from dotenv import load_dotenv
 

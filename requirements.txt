@@ -3,3 +3,5 @@ requests
 pandas
 supabase
 python-dotenv
+sqlalchemy 
+psycopg2-binary
