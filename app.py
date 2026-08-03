@@ -176,7 +176,7 @@ with tab2:
                         from app.services.conta_azul_receitas import criar_receita_no_conta_azul
                         descricao_completa = f"{descricao or 'Boleto'} - Aluno: {novo_nome.strip().upper()}"
                         receita = criar_receita_no_conta_azul(
-                            data_vencimento=row["Data Pagamento"],
+                            data_vencimento=row["Data Pagamento"].strftime('%Y-%m-%d') if hasattr(row["Data Pagamento"], 'strftime') else str(row["Data Pagamento"]),
                             valor=float(row["Valor Pago"]),
                             descricao=descricao_completa,
                             nome_cliente=novo_nome.strip().upper()

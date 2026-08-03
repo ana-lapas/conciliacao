@@ -164,7 +164,6 @@ def registrar_conciliacao(session: Session, ret, rem, resp: dict, lanc: dict) ->
 
     # Envio ao Conta Azul
     try:
-        from app.services.conta_azul_receitas import criar_receita_no_conta_azul
         descricao_completa = f"{descricao_remessa or 'Boleto'} - Aluno: {resp['nome']}"
         receita = criar_receita_no_conta_azul(
             data_vencimento=ret.data_pagamento.strftime('%Y-%m-%d'),
