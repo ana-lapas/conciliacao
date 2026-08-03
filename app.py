@@ -135,22 +135,67 @@ with tab2:
         if selected_id:
             row = df[df["ID"] == selected_id].iloc[0]
             novo_nome = st.text_input("Nome real do pagador (conforme boleto/PDF):", value=row["Nome Atual"])
-            if st.button("Aprovar e Liberar para Conta Azul"):
+            if st.button("Aprovar e Enviar para Conta Azul"):
                 with engine.begin() as conn:
+                    # 1. Atualiza o nome e status
                     conn.execute(
                         text("UPDATE payment_match SET nome_responsavel = :nome, status = 'CONCILIADO' WHERE id = :id"),
                         {"nome": novo_nome.strip().upper(), "id": selected_id}
                     )
+                    # Copia valores do retorno para o payment_match (caso ainda não existam)
                     conn.execute(
-                        text("UPDATE retorno SET status = 'CONCILIADO' WHERE id = :rid"),
-                        {"rid": int(row["Retorno ID"])}
+                        text("""
+                            UPDATE payment_match SET
+                                valor_pago = r.valor_pago,
+                                data_pagamento = r.data_pagamento,
+                                data_vencimento = r.data_vencimento
+                            FROM retorno r
+                            WHERE payment_match.id = :pm_id AND r.id = :ret_id
+                        """),
+                        {"pm_id": selected_id, "ret_id": int(row["Retorno ID"])}
                     )
-                st.success("Pagamento aprovado! Agora ele está CONCILIADO.")
+
+                    # 2. Busca a descrição da remessa (se houver)
+                    descricao = None
+                    row_desc = conn.execute(
+                        text("SELECT mensagem1, mensagem2, mensagem3, mensagem4 FROM remessa_mensagem WHERE nosso_numero = :nn"),
+                        {"nn": row["Nosso Número"]}
+                    ).first()
+                    if row_desc:
+                        partes = [row_desc.mensagem1, row_desc.mensagem2, row_desc.mensagem3, row_desc.mensagem4]
+                        descricao = " | ".join(p for p in partes if p)
+                        conn.execute(
+                            text("UPDATE payment_match SET descricao_pagamento = :desc WHERE id = :id"),
+                            {"desc": descricao, "id": selected_id}
+                        )
+
+                    # 3. Tenta enviar ao Conta Azul
+                    try:
+                        from app.services.conta_azul_receitas import criar_receita_no_conta_azul
+                        descricao_completa = f"{descricao or 'Boleto'} - Aluno: {novo_nome.strip().upper()}"
+                        receita = criar_receita_no_conta_azul(
+                            data_vencimento=row["Data Pagamento"],
+                            valor=float(row["Valor Pago"]),
+                            descricao=descricao_completa,
+                            nome_cliente=novo_nome.strip().upper()
+                        )
+                        conn.execute(
+                            text("UPDATE payment_match SET conta_azul_receita_id = :caid WHERE id = :id"),
+                            {"caid": receita["id"], "id": selected_id}
+                        )
+                        st.success("Pagamento aprovado e receita criada no Conta Azul!")
+                    except Exception as e:
+                        conn.execute(
+                            text("UPDATE payment_match SET mensagem = :msg WHERE id = :id"),
+                            {"msg": f"Erro Conta Azul: {str(e)[:200]}", "id": selected_id}
+                        )
+                        st.warning(f"Pagamento aprovado, mas houve falha ao enviar para o Conta Azul: {e}. Você pode reenviar depois.")
+                
                 st.rerun()
     else:
         st.info("Nenhum pagamento pendente de revisão.")
 # =============================================================================
-# Aba 3: Conciliações Prontas (revisão final e exportação)
+# Aba 3: Conciliações Prontas (revisão final, exportação e envio ao Conta Azul)
 # =============================================================================
 with tab3:
     st.header("Pagamentos Conciliados (Prontos para Exportação)")
@@ -159,8 +204,11 @@ with tab3:
         conciliados = conn.execute(
             text("""
                 SELECT pm.id, pm.retorno_id, r.nosso_numero, pm.nome_responsavel,
-                       pm.cpf_responsavel, pm.valor_pago, pm.data_pagamento,
-                       pm.data_vencimento, pm.mensagem
+                    pm.cpf_responsavel,
+                    COALESCE(pm.valor_pago, r.valor_pago) AS valor_pago,
+                    COALESCE(pm.data_pagamento, r.data_pagamento) AS data_pagamento,
+                    COALESCE(pm.data_vencimento, r.data_vencimento) AS data_vencimento,
+                    pm.mensagem, pm.conta_azul_receita_id
                 FROM payment_match pm
                 JOIN retorno r ON r.id = pm.retorno_id
                 WHERE pm.status = 'CONCILIADO'
@@ -171,10 +219,16 @@ with tab3:
         df_conciliados = pd.DataFrame(
             conciliados,
             columns=["ID", "Retorno ID", "Nosso Número", "Nome Responsável",
-                     "CPF", "Valor Pago", "Data Pagamento", "Vencimento", "Mensagem"]
+                     "CPF", "Valor Pago", "Data Pagamento", "Vencimento",
+                     "Mensagem", "Enviado ao Conta Azul?"]
+        )
+        # Substitui None por "Não" e preenche com "Sim" se houver ID
+        df_conciliados["Enviado ao Conta Azul?"] = df_conciliados["Enviado ao Conta Azul?"].apply(
+            lambda x: "Sim" if x else "Não"
         )
         st.dataframe(df_conciliados, width='stretch')
 
+        # Seção de ações rápidas
         st.subheader("Ações")
         col1, col2 = st.columns(2)
 
@@ -202,6 +256,56 @@ with tab3:
                     file_name="conciliações_prontas.csv",
                     mime="text/csv"
                 )
+
+        # Seção de envio ao Conta Azul
+        st.subheader("Envio ao Conta Azul")
+        # Conta quantos ainda não foram enviados
+        nao_enviados = df_conciliados[df_conciliados["Enviado ao Conta Azul?"] == "Não"]
+        if not nao_enviados.empty:
+            st.info(f"Existem {len(nao_enviados)} registro(s) ainda não enviados ao Conta Azul.")
+            if st.button("Reenviar todos os não enviados"):
+                progresso = st.progress(0)
+                sucessos = 0
+                falhas = 0
+                total = len(nao_enviados)
+                for i, (idx, row) in enumerate(nao_enviados.iterrows()):
+                    try:
+                        # Busca a descrição (se houver)
+                        descricao = row.get("descricao_pagamento")  # coluna ainda não existe no DataFrame, mas vamos ignorar
+                        # Como não temos a descrição no select, faremos um novo select rápido
+                        with engine.connect() as conn2:
+                            desc_row = conn2.execute(
+                                text("SELECT descricao_pagamento FROM payment_match WHERE id = :id"),
+                                {"id": row["ID"]}
+                            ).first()
+                            descricao_atual = desc_row[0] if desc_row else None
+                        from app.services.conta_azul_receitas import criar_receita_no_conta_azul
+
+                        descricao_completa = f"{descricao_atual or 'Boleto'} - Aluno: {row['Nome Responsável']}"
+                        receita = criar_receita_no_conta_azul(
+                            data_vencimento=str(row["Data Pagamento"]),
+                            valor=float(row["Valor Pago"]),
+                            descricao=descricao_completa,
+                            nome_cliente=row["Nome Responsável"]
+                        )
+                        with engine.begin() as conn3:
+                            conn3.execute(
+                                text("UPDATE payment_match SET conta_azul_receita_id = :caid WHERE id = :id"),
+                                {"caid": receita["id"], "id": row["ID"]}
+                            )
+                        sucessos += 1
+                    except Exception as e:
+                        falhas += 1
+                        with engine.begin() as conn3:
+                            conn3.execute(
+                                text("UPDATE payment_match SET mensagem = :msg WHERE id = :id"),
+                                {"msg": f"Erro no reenvio: {str(e)[:200]}", "id": row["ID"]}
+                            )
+                    progresso.progress((i + 1) / total)
+                st.success(f"Reenvio concluído: {sucessos} sucessos, {falhas} falhas.")
+                st.rerun()
+        else:
+            st.success("Todos os registros conciliados já foram enviados ao Conta Azul.")
     else:
         st.info("Nenhum pagamento conciliado no momento.")
 
