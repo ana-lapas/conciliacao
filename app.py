@@ -142,15 +142,17 @@ with tab2:
                         text("UPDATE payment_match SET nome_responsavel = :nome, status = 'CONCILIADO' WHERE id = :id"),
                         {"nome": novo_nome.strip().upper(), "id": selected_id}
                     )
-                    # Copia valores do retorno para o payment_match (caso ainda não existam)
+                    # Copia valores do retorno e, se possível, a data de vencimento da remessa
                     conn.execute(
                         text("""
-                            UPDATE payment_match SET
+                            UPDATE payment_match pm
+                            SET
                                 valor_pago = r.valor_pago,
                                 data_pagamento = r.data_pagamento,
-                                data_vencimento = r.data_vencimento
+                                data_vencimento = COALESCE(pm.data_vencimento, rem.data_vencimento)
                             FROM retorno r
-                            WHERE payment_match.id = :pm_id AND r.id = :ret_id
+                            LEFT JOIN remessa rem ON rem.nosso_numero = r.nosso_numero
+                            WHERE pm.id = :pm_id AND r.id = :ret_id
                         """),
                         {"pm_id": selected_id, "ret_id": int(row["Retorno ID"])}
                     )
@@ -207,7 +209,7 @@ with tab3:
                     pm.cpf_responsavel,
                     COALESCE(pm.valor_pago, r.valor_pago) AS valor_pago,
                     COALESCE(pm.data_pagamento, r.data_pagamento) AS data_pagamento,
-                    COALESCE(pm.data_vencimento, r.data_vencimento) AS data_vencimento,
+                    pm.data_vencimento,
                     pm.mensagem, pm.conta_azul_receita_id
                 FROM payment_match pm
                 JOIN retorno r ON r.id = pm.retorno_id
