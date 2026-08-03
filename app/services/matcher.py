@@ -25,7 +25,7 @@ from sqlalchemy.orm import Session
 from app.services.sofia_api import SofiaAPI
 from app.services.cache_sync import SessionLocal 
 
-from app.services.conta_azul_receitas import criar_receita_no_conta_azul
+from app.services.conta_azul_receitas import criar_receita_com_baixa
 
 logger = logging.getLogger(__name__)
 
@@ -165,17 +165,18 @@ def registrar_conciliacao(session: Session, ret, rem, resp: dict, lanc: dict) ->
     # Envio ao Conta Azul
     try:
         descricao_completa = f"{descricao_remessa or 'Boleto'} - Aluno: {resp['nome']}"
-        receita = criar_receita_no_conta_azul(
+        parcela_id = criar_receita_com_baixa(
             data_vencimento=ret.data_pagamento.strftime('%Y-%m-%d'),
             valor=float(ret.valor_pago),
             descricao=descricao_completa,
-            nome_cliente=resp["nome"]
+            nome_cliente=resp["nome"],
+            data_pagamento=ret.data_pagamento.strftime('%Y-%m-%d')   # pago na mesma data
         )
         session.execute(
             text("UPDATE payment_match SET conta_azul_receita_id = :caid WHERE retorno_id = :rid"),
-            {"caid": receita["id"], "rid": ret.id}
+            {"caid": parcela_id, "rid": ret.id}
         )
-        logger.info(f"Receita Conta Azul criada (ID: {receita['id']})")
+        logger.info(f"Receita Conta Azul criada (ID: {parcela_id})")
     except Exception as e:
         logger.error(f"Falha ao enviar para Conta Azul: {e}")
         session.execute(

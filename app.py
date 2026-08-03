@@ -173,17 +173,20 @@ with tab2:
 
                     # 4. Envio ao Conta Azul
                     try:
-                        from app.services.conta_azul_receitas import criar_receita_no_conta_azul
+                        from app.services.conta_azul_receitas import criar_receita_com_baixa
                         descricao_completa = f"{descricao or 'Boleto'} - Aluno: {novo_nome.strip().upper()}"
-                        receita = criar_receita_no_conta_azul(
-                            data_vencimento=row["Data Pagamento"].strftime('%Y-%m-%d') if hasattr(row["Data Pagamento"], 'strftime') else str(row["Data Pagamento"]),
+                        data_pagamento_str = row["Data Pagamento"].strftime('%Y-%m-%d') if hasattr(row["Data Pagamento"], 'strftime') else str(row["Data Pagamento"])
+
+                        parcela_id = criar_receita_com_baixa(
+                            data_vencimento=data_pagamento_str,
                             valor=float(row["Valor Pago"]),
                             descricao=descricao_completa,
-                            nome_cliente=novo_nome.strip().upper()
+                            nome_cliente=novo_nome.strip().upper(),
+                            data_pagamento=data_pagamento_str
                         )
                         conn.execute(
                             text("UPDATE payment_match SET conta_azul_receita_id = :caid WHERE id = :id"),
-                            {"caid": receita["id"], "id": selected_id}
+                            {"caid": parcela_id, "id": selected_id}
                         )
                         st.success("Pagamento aprovado e receita criada no Conta Azul!")
                     except Exception as e:
@@ -280,20 +283,20 @@ with tab3:
                                 {"id": row["ID"]}
                             ).first()
                             descricao_atual = desc_row[0] if desc_row else None
-                        from app.services.conta_azul_receitas import criar_receita_no_conta_azul
+                        from app.services.conta_azul_receitas import criar_receita_com_baixa
 
                         descricao_completa = f"{descricao_atual or 'Boleto'} - Aluno: {row['Nome Responsável']}"
-                        receita = criar_receita_no_conta_azul(
+                        parcela_id = criar_receita_com_baixa(
                             data_vencimento=str(row["Data Pagamento"]),
                             valor=float(row["Valor Pago"]),
                             descricao=descricao_completa,
-                            nome_cliente=row["Nome Responsável"]
+                            nome_cliente=row["Nome Responsável"],
+                            data_pagamento=str(row["Data Pagamento"])      # pago na mesma data
                         )
-                        with engine.begin() as conn3:
-                            conn3.execute(
-                                text("UPDATE payment_match SET conta_azul_receita_id = :caid WHERE id = :id"),
-                                {"caid": receita["id"], "id": row["ID"]}
-                            )
+                        conn3.execute(
+                            text("UPDATE payment_match SET conta_azul_receita_id = :caid WHERE id = :id"),
+                            {"caid": parcela_id, "id": row["ID"]}
+                        )
                         sucessos += 1
                     except Exception as e:
                         falhas += 1
@@ -348,3 +351,24 @@ with tab4:
         auth_url, state = get_authorization_url()
         st.session_state["oauth_state"] = state
         st.link_button("Conectar com Conta Azul", url=auth_url)
+
+    # Na aba Conta Azul (tab4), adicione:
+    st.subheader("Configurar contas e categorias")
+    conta_uuid = st.text_input("UUID da Conta Financeira (Conta Azul)")
+    cat_uuid = st.text_input("UUID da Categoria (Conta Azul)")
+    if st.button("Salvar configuração"):
+        from app.services.conta_azul_utils import definir_configuracao
+        definir_configuracao(conta_uuid, cat_uuid)
+        st.success("Configuração salva!")
+
+    # dentro de tab4
+    if st.button("Carregar contas financeiras"):
+        contas = listar_contas_financeiras()
+        st.session_state.contas = contas
+
+    if "contas" in st.session_state:
+        opcoes = {c["nome"]: c["id"] for c in st.session_state.contas}
+        selecionada = st.selectbox("Selecione a conta financeira:", list(opcoes.keys()))
+        if st.button("Salvar conta selecionada"):
+            definir_configuracao(opcoes[selecionada])
+            st.success("Conta financeira configurada!")
