@@ -34,11 +34,7 @@ logger = logging.getLogger(__name__)
 # ------------------------------------------------------------------------------
 
 def buscar_responsaveis(session: Session, nome: Optional[str] = None, cpf: Optional[str] = None) -> List[Dict[str, Any]]:
-    """
-    Busca responsáveis financeiros no cache pelo nome e/ou CPF.
-    Pelo menos um dos parâmetros deve ser fornecido.
-    Retorna lista de dicionários com student_id, student_responsible_id, nome, cpf.
-    """
+    """Busca responsáveis financeiros no cache pelo nome e/ou CPF."""
     if cpf:
         query = text("""
             SELECT sr.student_id, sr.id AS student_responsible_id, sr.nome, sr.cpf
@@ -54,16 +50,13 @@ def buscar_responsaveis(session: Session, nome: Optional[str] = None, cpf: Optio
         """)
         params = {"nome": f"%{nome}%"}
     else:
-        return []  # sem critério
-
+        return []
     rows = session.execute(query, params).fetchall()
     return [dict(row._mapping) for row in rows]
 
+
 def obter_descricao_pagamento(session: Session, nosso_numero: str) -> Optional[str]:
-    """
-    Busca as mensagens do registro tipo 2 da remessa.
-    Concatena as mensagens não vazias separadas por " | ".
-    """
+    """Busca as mensagens do registro tipo 2 da remessa."""
     row = session.execute(
         text("SELECT mensagem1, mensagem2, mensagem3, mensagem4 FROM remessa_mensagem WHERE nosso_numero = :nn"),
         {"nn": nosso_numero}
@@ -71,55 +64,84 @@ def obter_descricao_pagamento(session: Session, nosso_numero: str) -> Optional[s
     if not row:
         return None
     partes = [row.mensagem1, row.mensagem2, row.mensagem3, row.mensagem4]
-    return " | ".join(p for p in partes if p)  # remove as vazias
-
+    return " | ".join(p for p in partes if p)
 
 def registrar_conciliacao(session: Session, ret, rem, resp: dict, lanc: dict) -> None:
-    """
-    Registra o pagamento como CONCILIADO, atualiza status e envia ao Conta Azul.
-    
-    Parâmetros:
-        session: sessão do banco de dados.
-        ret: objeto do retorno (tabela retorno).
-        rem: objeto da remessa (tabela remessa) ou None.
-        resp: dicionário com dados do responsável (student_responsible).
-        lanc: dicionário com dados do lançamento do Sophia.
-    """
+    """Registra pagamento como CONCILIADO, atualiza status e envia ao Conta Azul."""
     nome = resp.get('nome')
     if not nome or not nome.strip():
         nome = "NÃO INFORMADO"
 
-    # 1. Insere o registro CONCILIADO
-    session.execute(
-        text("""
-            INSERT INTO payment_match (
-                retorno_id, remessa_id, student_id, student_responsible_id,
-                nome_responsavel, cpf_responsavel,
-                lancamento_codigo, valor_pago, valor_previsto,
-                data_pagamento, data_vencimento, status
-            ) VALUES (
-                :rid, :remid, :sid, :srid,
-                :nome_resp, :cpf_resp,
-                :lcod, :vpago, :vprev,
-                :dpgto, :dvenc, 'CONCILIADO'
-            )
-        """),
-        {
-            "rid": ret.id,
-            "remid": rem.id if rem else None,
-            "sid": resp["student_id"],
-            "srid": resp["student_responsible_id"],
-            "nome_resp": resp["nome"],
-            "cpf_resp": resp.get("cpf"),
-            "lcod": lanc["codigo"],
-            "vpago": float(ret.valor_pago),
-            "vprev": float(lanc["valorPrevisto"]),
-            "dpgto": ret.data_pagamento,
-            "dvenc": lanc["dataVencimento"]
-        }
-    )
+    # Verifica se já existe registro para este retorno (evita duplicidade)
+    existente = session.execute(
+        text("SELECT id FROM payment_match WHERE retorno_id = :rid"),
+        {"rid": ret.id}
+    ).first()
 
-    # 2. Atualiza status do retorno e, se existir, da remessa
+    if existente:
+        # Atualiza o existente
+        session.execute(
+            text("""
+                UPDATE payment_match SET
+                    remessa_id = :remid,
+                    student_id = :sid,
+                    student_responsible_id = :srid,
+                    nome_responsavel = :nome_resp,
+                    cpf_responsavel = :cpf_resp,
+                    lancamento_codigo = :lcod,
+                    valor_pago = :vpago,
+                    valor_previsto = :vprev,
+                    data_pagamento = :dpgto,
+                    data_vencimento = :dvenc,
+                    status = 'CONCILIADO',
+                    mensagem = NULL
+                WHERE id = :id
+            """),
+            {
+                "remid": rem.id if rem else None,
+                "sid": resp["student_id"],
+                "srid": resp["student_responsible_id"],
+                "nome_resp": nome,
+                "cpf_resp": resp.get("cpf"),
+                "lcod": lanc["codigo"],
+                "vpago": float(ret.valor_pago),
+                "vprev": float(lanc["valorPrevisto"]),
+                "dpgto": ret.data_pagamento,
+                "dvenc": lanc["dataVencimento"],
+                "id": existente.id
+            }
+        )
+    else:
+        session.execute(
+            text("""
+                INSERT INTO payment_match (
+                    retorno_id, remessa_id, student_id, student_responsible_id,
+                    nome_responsavel, cpf_responsavel,
+                    lancamento_codigo, valor_pago, valor_previsto,
+                    data_pagamento, data_vencimento, status
+                ) VALUES (
+                    :rid, :remid, :sid, :srid,
+                    :nome_resp, :cpf_resp,
+                    :lcod, :vpago, :vprev,
+                    :dpgto, :dvenc, 'CONCILIADO'
+                )
+            """),
+            {
+                "rid": ret.id,
+                "remid": rem.id if rem else None,
+                "sid": resp["student_id"],
+                "srid": resp["student_responsible_id"],
+                "nome_resp": nome,
+                "cpf_resp": resp.get("cpf"),
+                "lcod": lanc["codigo"],
+                "vpago": float(ret.valor_pago),
+                "vprev": float(lanc["valorPrevisto"]),
+                "dpgto": ret.data_pagamento,
+                "dvenc": lanc["dataVencimento"]
+            }
+        )
+
+    # Atualiza status do retorno e remessa
     session.execute(
         text("UPDATE retorno SET status = 'CONCILIADO' WHERE id = :rid"),
         {"rid": ret.id}
@@ -132,7 +154,7 @@ def registrar_conciliacao(session: Session, ret, rem, resp: dict, lanc: dict) ->
 
     logger.info(f"Retorno {ret.id}: CONCILIADO (nosso número {ret.nosso_numero})")
 
-    # 3. Obtém a descrição do pagamento (remessa tipo 2)
+    # Descrição da remessa
     descricao_remessa = obter_descricao_pagamento(session, ret.nosso_numero)
     if descricao_remessa:
         session.execute(
@@ -140,8 +162,9 @@ def registrar_conciliacao(session: Session, ret, rem, resp: dict, lanc: dict) ->
             {"desc": descricao_remessa, "rid": ret.id}
         )
 
-    # 4. Tenta criar a receita no Conta Azul
+    # Envio ao Conta Azul
     try:
+        from app.services.conta_azul_receitas import criar_receita_no_conta_azul
         descricao_completa = f"{descricao_remessa or 'Boleto'} - Aluno: {resp['nome']}"
         receita = criar_receita_no_conta_azul(
             data_vencimento=ret.data_pagamento.strftime('%Y-%m-%d'),
@@ -149,57 +172,52 @@ def registrar_conciliacao(session: Session, ret, rem, resp: dict, lanc: dict) ->
             descricao=descricao_completa,
             nome_cliente=resp["nome"]
         )
-        # Armazena o ID retornado pela API
         session.execute(
             text("UPDATE payment_match SET conta_azul_receita_id = :caid WHERE retorno_id = :rid"),
             {"caid": receita["id"], "rid": ret.id}
         )
         logger.info(f"Receita Conta Azul criada (ID: {receita['id']})")
     except Exception as e:
-        # Falha na API não interrompe a conciliação – apenas registra o erro
         logger.error(f"Falha ao enviar para Conta Azul: {e}")
-        # Opcional: salvar a mensagem de erro no payment_match para exibição futura
         session.execute(
             text("UPDATE payment_match SET mensagem = :msg WHERE retorno_id = :rid"),
             {"msg": f"Erro Conta Azul: {str(e)[:200]}", "rid": ret.id}
         )
 
-
 def registrar_pendente_revisao(session: Session, ret, mensagem: str, nome_pagador: Optional[str] = None) -> None:
-    """
-    Marca o retorno como PENDENTE_REVISAO e insere em payment_match.
-    O nome_pagador, se fornecido, será usado como nome do pagador (placeholder ou nome extraído).
-    """
+    """Marca o retorno como PENDENTE_REVISAO e insere/atualiza em payment_match."""
     nome = nome_pagador or f"PAGADOR NÃO IDENTIFICADO – Nosso Número {ret.nosso_numero}"
-    session.execute(
-        text("""
-            INSERT INTO payment_match (retorno_id, nome_responsavel, status, mensagem)
-            VALUES (:rid, :nome, 'PENDENTE_REVISAO', :msg)
-        """),
-        {"rid": ret.id, "nome": nome, "msg": mensagem}
-    )
+
+    existente = session.execute(
+        text("SELECT id FROM payment_match WHERE retorno_id = :rid"),
+        {"rid": ret.id}
+    ).first()
+
+    if existente:
+        session.execute(
+            text("UPDATE payment_match SET nome_responsavel = :nome, status = 'PENDENTE_REVISAO', mensagem = :msg WHERE id = :id"),
+            {"nome": nome, "msg": mensagem, "id": existente.id}
+        )
+    else:
+        session.execute(
+            text("""
+                INSERT INTO payment_match (retorno_id, nome_responsavel, status, mensagem)
+                VALUES (:rid, :nome, 'PENDENTE_REVISAO', :msg)
+            """),
+            {"rid": ret.id, "nome": nome, "msg": mensagem}
+        )
+
     session.execute(
         text("UPDATE retorno SET status = 'PENDENTE_REVISAO' WHERE id = :rid"),
         {"rid": ret.id}
     )
     logger.info(f"Retorno {ret.id}: PENDENTE_REVISAO - {mensagem}")
 
-
 def encontrar_lancamento(
-    api: SofiaAPI,
-    student_id: int,
-    nosso_numero: str,
-    valor_pago: float,
-    data_pagamento: str
+    api: SofiaAPI, student_id: int, nosso_numero: str,
+    valor_pago: float, data_pagamento: str
 ) -> Optional[Dict[str, Any]]:
-    """
-    Busca o lançamento no Sophia que corresponde ao pagamento.
-
-    Critérios (em ordem):
-    1. numeroBoleto igual ao nosso_numero e recebido == 0.
-    2. Valor exato e data de vencimento próxima (tolerância de 5 dias).
-    Retorna o dicionário do lançamento ou None.
-    """
+    """Busca o lançamento no Sophia que corresponde ao pagamento."""
     try:
         lancamentos = api.obter_lancamentos(student_id)
     except Exception as e:
@@ -213,24 +231,19 @@ def encontrar_lancamento(
     for lanc in lancamentos:
         if lanc.get("recebido") != 0:
             continue
-
         if str(lanc.get("numeroBoleto", "")) == nosso_numero:
             logger.debug(f"Match por nosso número: {nosso_numero}")
             return lanc
-
         try:
             valor_previsto = float(lanc.get("valorPrevisto", 0))
         except (TypeError, ValueError):
             continue
-
         if abs(valor_previsto - valor_pago) > 0.01:
             continue
-
         try:
             data_venc = datetime.strptime(lanc.get("dataVencimento", ""), '%Y-%m-%d')
         except (ValueError, TypeError):
             continue
-
         diferenca = abs((data_venc - data_pgto).days)
         if diferenca <= 5 and diferenca < melhor_diferenca:
             melhor_diferenca = diferenca
@@ -240,12 +253,8 @@ def encontrar_lancamento(
         logger.debug(f"Match por valor/data: dif={melhor_diferenca} dias")
     return melhor_lancamento
 
-
 def encontrar_aluno_por_nosso_numero(api: SofiaAPI, session: Session, nosso_numero: str):
-    """
-    Varre todos os alunos do cache e busca nos lançamentos o numeroBoleto.
-    Retorna (student_id, responsavelFinanceiro) ou (None, None).
-    """
+    """Varre alunos do cache para achar o lançamento pelo numeroBoleto."""
     alunos = session.execute(text("SELECT sophia_id FROM student")).fetchall()
     for (sophia_id,) in alunos:
         try:
@@ -256,7 +265,6 @@ def encontrar_aluno_por_nosso_numero(api: SofiaAPI, session: Session, nosso_nume
             if str(lanc.get("numeroBoleto")) == nosso_numero:
                 return sophia_id, lanc.get("responsavelFinanceiro")
     return None, None
-
 
 # ------------------------------------------------------------------------------
 # Função principal de conciliação
@@ -276,7 +284,7 @@ def conciliar_retorno(api: SofiaAPI) -> None:
         logger.info(f"Iniciando conciliação de {len(retornos)} retornos...")
 
         for ret in retornos:
-            # 1. Remessa é obrigatória
+            # 1. Remessa obrigatória
             rem = session.execute(
                 text("SELECT * FROM remessa WHERE nosso_numero = :nn"),
                 {"nn": ret.nosso_numero}
@@ -292,10 +300,9 @@ def conciliar_retorno(api: SofiaAPI) -> None:
             nome_busca = rem.nome_pagador
             cpf_busca = rem.cpf_pagador
 
-            # Se o nome não for um texto válido (vazio ou apenas dígitos)
+            # 2. Nome inválido (vazio ou apenas dígitos)
             if not nome_busca or nome_busca.isdigit():
-                # Tenta busca reversa para ao menos identificar o aluno
-                student_id, nome_resp = encontrar_aluno_por_nosso_numero(api, session, ret.nosso_numero)
+                student_id, _ = encontrar_aluno_por_nosso_numero(api, session, ret.nosso_numero)
                 if student_id:
                     registrar_pendente_revisao(
                         session, ret,
@@ -309,7 +316,7 @@ def conciliar_retorno(api: SofiaAPI) -> None:
                     )
                 continue
 
-            # Nome válido: buscar no cache de responsáveis
+            # 3. Buscar responsáveis no cache
             resp_rows = buscar_responsaveis(session, nome=nome_busca, cpf=cpf_busca)
             if not resp_rows:
                 registrar_pendente_revisao(
@@ -319,7 +326,7 @@ def conciliar_retorno(api: SofiaAPI) -> None:
                 )
                 continue
 
-            # Tentar match com cada responsável
+            # 4. Tentar match com cada responsável
             match_resp = None
             match_lanc = None
             for resp in resp_rows:

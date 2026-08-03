@@ -137,12 +137,12 @@ with tab2:
             novo_nome = st.text_input("Nome real do pagador (conforme boleto/PDF):", value=row["Nome Atual"])
             if st.button("Aprovar e Enviar para Conta Azul"):
                 with engine.begin() as conn:
-                    # 1. Atualiza o nome e status
+                    # 1. Atualiza nome e status
                     conn.execute(
                         text("UPDATE payment_match SET nome_responsavel = :nome, status = 'CONCILIADO' WHERE id = :id"),
                         {"nome": novo_nome.strip().upper(), "id": selected_id}
                     )
-                    # Copia valores do retorno e, se possível, a data de vencimento da remessa
+                    # 2. Copia valores do retorno e data de vencimento da remessa (se existir)
                     conn.execute(
                         text("""
                             UPDATE payment_match pm
@@ -157,7 +157,7 @@ with tab2:
                         {"pm_id": selected_id, "ret_id": int(row["Retorno ID"])}
                     )
 
-                    # 2. Busca a descrição da remessa (se houver)
+                    # 3. Descrição da remessa
                     descricao = None
                     row_desc = conn.execute(
                         text("SELECT mensagem1, mensagem2, mensagem3, mensagem4 FROM remessa_mensagem WHERE nosso_numero = :nn"),
@@ -171,7 +171,7 @@ with tab2:
                             {"desc": descricao, "id": selected_id}
                         )
 
-                    # 3. Tenta enviar ao Conta Azul
+                    # 4. Envio ao Conta Azul
                     try:
                         from app.services.conta_azul_receitas import criar_receita_no_conta_azul
                         descricao_completa = f"{descricao or 'Boleto'} - Aluno: {novo_nome.strip().upper()}"
@@ -192,7 +192,6 @@ with tab2:
                             {"msg": f"Erro Conta Azul: {str(e)[:200]}", "id": selected_id}
                         )
                         st.warning(f"Pagamento aprovado, mas houve falha ao enviar para o Conta Azul: {e}. Você pode reenviar depois.")
-                
                 st.rerun()
     else:
         st.info("Nenhum pagamento pendente de revisão.")
