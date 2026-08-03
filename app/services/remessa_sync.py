@@ -60,6 +60,30 @@ def sincronizar_remessa(caminho_rem: str):
             """),
             dados_para_insert
         )
+        # Sincronizar mensagens (tipo 2)
+        if reader.mensagens:
+            mensagens_insert = []
+            for msg in reader.mensagens:
+                mensagens_insert.append({
+                    "nosso_numero": msg["nosso_numero"],
+                    "mensagem1": msg["mensagem1"],
+                    "mensagem2": msg["mensagem2"],
+                    "mensagem3": msg["mensagem3"],
+                    "mensagem4": msg["mensagem4"],
+                })
+            session.execute(
+                text("""
+                    INSERT INTO remessa_mensagem (nosso_numero, mensagem1, mensagem2, mensagem3, mensagem4)
+                    VALUES (:nosso_numero, :mensagem1, :mensagem2, :mensagem3, :mensagem4)
+                    ON CONFLICT (nosso_numero) DO UPDATE SET
+                        mensagem1 = EXCLUDED.mensagem1,
+                        mensagem2 = EXCLUDED.mensagem2,
+                        mensagem3 = EXCLUDED.mensagem3,
+                        mensagem4 = EXCLUDED.mensagem4
+                """),
+                mensagens_insert
+            )
+            logger.info(f"Mensagens sincronizadas: {len(reader.mensagens)} registros.")
         session.commit()
         logger.info(f"Remessa sincronizada: {len(registros)} registros.")
     except Exception:

@@ -25,6 +25,8 @@ from sqlalchemy.orm import Session
 from app.services.sofia_api import SofiaAPI
 from app.services.cache_sync import SessionLocal 
 
+from app.services.conta_azul_receitas import criar_receita_no_conta_azul
+
 logger = logging.getLogger(__name__)
 
 # ------------------------------------------------------------------------------
@@ -57,14 +59,37 @@ def buscar_responsaveis(session: Session, nome: Optional[str] = None, cpf: Optio
     rows = session.execute(query, params).fetchall()
     return [dict(row._mapping) for row in rows]
 
+def obter_descricao_pagamento(session: Session, nosso_numero: str) -> Optional[str]:
+    """
+    Busca as mensagens do registro tipo 2 da remessa.
+    Concatena as mensagens não vazias separadas por " | ".
+    """
+    row = session.execute(
+        text("SELECT mensagem1, mensagem2, mensagem3, mensagem4 FROM remessa_mensagem WHERE nosso_numero = :nn"),
+        {"nn": nosso_numero}
+    ).first()
+    if not row:
+        return None
+    partes = [row.mensagem1, row.mensagem2, row.mensagem3, row.mensagem4]
+    return " | ".join(p for p in partes if p)  # remove as vazias
+
 
 def registrar_conciliacao(session: Session, ret, rem, resp: dict, lanc: dict) -> None:
     """
-    Registra pagamento como CONCILIADO.
-    Atualiza retorno e remessa (se existir) para CONCILIADO/PAGO.
-    O nome do pagador vem de resp['nome'] (que é o nome do cache, já em maiúsculas,
-    que deve corresponder ao nome da remessa/retorno validado).
+    Registra o pagamento como CONCILIADO, atualiza status e envia ao Conta Azul.
+    
+    Parâmetros:
+        session: sessão do banco de dados.
+        ret: objeto do retorno (tabela retorno).
+        rem: objeto da remessa (tabela remessa) ou None.
+        resp: dicionário com dados do responsável (student_responsible).
+        lanc: dicionário com dados do lançamento do Sophia.
     """
+    nome = resp.get('nome')
+    if not nome or not nome.strip():
+        nome = "NÃO INFORMADO"
+
+    # 1. Insere o registro CONCILIADO
     session.execute(
         text("""
             INSERT INTO payment_match (
@@ -93,6 +118,8 @@ def registrar_conciliacao(session: Session, ret, rem, resp: dict, lanc: dict) ->
             "dvenc": lanc["dataVencimento"]
         }
     )
+
+    # 2. Atualiza status do retorno e, se existir, da remessa
     session.execute(
         text("UPDATE retorno SET status = 'CONCILIADO' WHERE id = :rid"),
         {"rid": ret.id}
@@ -102,7 +129,40 @@ def registrar_conciliacao(session: Session, ret, rem, resp: dict, lanc: dict) ->
             text("UPDATE remessa SET status = 'PAGO' WHERE id = :remid"),
             {"remid": rem.id}
         )
+
     logger.info(f"Retorno {ret.id}: CONCILIADO (nosso número {ret.nosso_numero})")
+
+    # 3. Obtém a descrição do pagamento (remessa tipo 2)
+    descricao_remessa = obter_descricao_pagamento(session, ret.nosso_numero)
+    if descricao_remessa:
+        session.execute(
+            text("UPDATE payment_match SET descricao_pagamento = :desc WHERE retorno_id = :rid"),
+            {"desc": descricao_remessa, "rid": ret.id}
+        )
+
+    # 4. Tenta criar a receita no Conta Azul
+    try:
+        descricao_completa = f"{descricao_remessa or 'Boleto'} - Aluno: {resp['nome']}"
+        receita = criar_receita_no_conta_azul(
+            data_vencimento=ret.data_pagamento.strftime('%Y-%m-%d'),
+            valor=float(ret.valor_pago),
+            descricao=descricao_completa,
+            nome_cliente=resp["nome"]
+        )
+        # Armazena o ID retornado pela API
+        session.execute(
+            text("UPDATE payment_match SET conta_azul_receita_id = :caid WHERE retorno_id = :rid"),
+            {"caid": receita["id"], "rid": ret.id}
+        )
+        logger.info(f"Receita Conta Azul criada (ID: {receita['id']})")
+    except Exception as e:
+        # Falha na API não interrompe a conciliação – apenas registra o erro
+        logger.error(f"Falha ao enviar para Conta Azul: {e}")
+        # Opcional: salvar a mensagem de erro no payment_match para exibição futura
+        session.execute(
+            text("UPDATE payment_match SET mensagem = :msg WHERE retorno_id = :rid"),
+            {"msg": f"Erro Conta Azul: {str(e)[:200]}", "rid": ret.id}
+        )
 
 
 def registrar_pendente_revisao(session: Session, ret, mensagem: str, nome_pagador: Optional[str] = None) -> None:
@@ -216,116 +276,70 @@ def conciliar_retorno(api: SofiaAPI) -> None:
         logger.info(f"Iniciando conciliação de {len(retornos)} retornos...")
 
         for ret in retornos:
-            # 1. Obter remessa associada (se existir)
+            # 1. Remessa é obrigatória
             rem = session.execute(
                 text("SELECT * FROM remessa WHERE nosso_numero = :nn"),
                 {"nn": ret.nosso_numero}
             ).first()
 
-            # ----------------------------------------------------------------
-            # SITUAÇÃO 1: Retorno tem nome de pagador válido (texto)
-            # ----------------------------------------------------------------
-            if ret.nome_pagador and not ret.nome_pagador.isdigit():
-                nome_busca = ret.nome_pagador
-                cpf_busca = ret.cpf_pagador  # pode ser None
-                resp_rows = buscar_responsaveis(session, nome=nome_busca, cpf=cpf_busca)
-
-                if resp_rows:
-                    # Tenta match com cada responsável
-                    match_resp = None
-                    match_lanc = None
-                    for resp in resp_rows:
-                        lanc = encontrar_lancamento(
-                            api, resp["student_id"], ret.nosso_numero,
-                            float(ret.valor_pago), ret.data_pagamento.isoformat()
-                        )
-                        if lanc:
-                            match_resp = resp
-                            match_lanc = lanc
-                            break
-
-                    if match_resp and match_lanc:
-                        # Conciliado automático (nome do retorno é válido e encontrado no cache)
-                        registrar_conciliacao(session, ret, rem, match_resp, match_lanc)
-                        continue
-                    else:
-                        # Responsável encontrado, mas lançamento não localizado
-                        registrar_pendente_revisao(
-                            session, ret,
-                            "Lançamento não encontrado para o responsável",
-                            nome_pagador=nome_busca
-                        )
-                        continue
-                else:
-                    # Nome não existe no cache -> PENDENTE_REVISAO
-                    registrar_pendente_revisao(
-                        session, ret,
-                        f"Responsável '{nome_busca}' não encontrado no cache",
-                        nome_pagador=nome_busca
-                    )
-                    continue
-
-            # ----------------------------------------------------------------
-            # SITUAÇÃO 2: Retorno sem nome, mas remessa tem nome válido
-            # ----------------------------------------------------------------
-            if rem and rem.nome_pagador and not rem.nome_pagador.isdigit():
-                nome_busca = rem.nome_pagador
-                cpf_busca = rem.cpf_pagador
-                resp_rows = buscar_responsaveis(session, nome=nome_busca, cpf=cpf_busca)
-
-                if resp_rows:
-                    match_resp = None
-                    match_lanc = None
-                    for resp in resp_rows:
-                        lanc = encontrar_lancamento(
-                            api, resp["student_id"], ret.nosso_numero,
-                            float(ret.valor_pago), ret.data_pagamento.isoformat()
-                        )
-                        if lanc:
-                            match_resp = resp
-                            match_lanc = lanc
-                            break
-
-                    if match_resp and match_lanc:
-                        # Nome veio da remessa, mas foi validado no cache
-                        registrar_conciliacao(session, ret, rem, match_resp, match_lanc)
-                        continue
-                    else:
-                        registrar_pendente_revisao(
-                            session, ret,
-                            "Lançamento não encontrado (nome da remessa)",
-                            nome_pagador=nome_busca
-                        )
-                        continue
-                else:
-                    # Nome da remessa não está no cache
-                    registrar_pendente_revisao(
-                        session, ret,
-                        f"Responsável da remessa '{nome_busca}' não encontrado no cache",
-                        nome_pagador=nome_busca
-                    )
-                    continue
-
-            # ----------------------------------------------------------------
-            # SITUAÇÃO 3: Nenhum nome válido (nem retorno, nem remessa) → busca reversa
-            # ----------------------------------------------------------------
-            student_id, nome_responsavel = encontrar_aluno_por_nosso_numero(api, session, ret.nosso_numero)
-            if student_id:
-                # Aluno encontrado, mas NÃO temos o nome real do pagador.
-                # Fica PENDENTE_REVISAO até que a secretária informe o nome.
+            if not rem:
                 registrar_pendente_revisao(
                     session, ret,
-                    "Aluno localizado via busca reversa, mas nome do pagador ausente. Informar manualmente.",
-                    nome_pagador=None  # placeholder será gerado
+                    "Remessa não encontrada para este título (obrigatória)."
                 )
                 continue
+
+            nome_busca = rem.nome_pagador
+            cpf_busca = rem.cpf_pagador
+
+            # Se o nome não for um texto válido (vazio ou apenas dígitos)
+            if not nome_busca or nome_busca.isdigit():
+                # Tenta busca reversa para ao menos identificar o aluno
+                student_id, nome_resp = encontrar_aluno_por_nosso_numero(api, session, ret.nosso_numero)
+                if student_id:
+                    registrar_pendente_revisao(
+                        session, ret,
+                        "Nome do pagador ausente na remessa, mas aluno localizado via busca reversa. Informar nome manualmente.",
+                        nome_pagador=None
+                    )
+                else:
+                    registrar_pendente_revisao(
+                        session, ret,
+                        "Nome do pagador ausente na remessa e busca reversa não encontrou o título."
+                    )
+                continue
+
+            # Nome válido: buscar no cache de responsáveis
+            resp_rows = buscar_responsaveis(session, nome=nome_busca, cpf=cpf_busca)
+            if not resp_rows:
+                registrar_pendente_revisao(
+                    session, ret,
+                    f"Responsável '{nome_busca}' não encontrado no cache.",
+                    nome_pagador=nome_busca
+                )
+                continue
+
+            # Tentar match com cada responsável
+            match_resp = None
+            match_lanc = None
+            for resp in resp_rows:
+                lanc = encontrar_lancamento(
+                    api, resp["student_id"], ret.nosso_numero,
+                    float(ret.valor_pago), ret.data_pagamento.isoformat()
+                )
+                if lanc:
+                    match_resp = resp
+                    match_lanc = lanc
+                    break
+
+            if match_resp and match_lanc:
+                registrar_conciliacao(session, ret, rem, match_resp, match_lanc)
             else:
-                # Busca reversa falhou
                 registrar_pendente_revisao(
                     session, ret,
-                    "Nenhum nome disponível e busca reversa não encontrou o título."
+                    "Lançamento não encontrado para o responsável.",
+                    nome_pagador=nome_busca
                 )
-                continue
 
         session.commit()
         logger.info("Conciliação concluída e transação confirmada.")

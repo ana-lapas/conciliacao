@@ -45,14 +45,14 @@ with tab1:
     col1, col2 = st.columns(2)
     with col1:
         ret_files = st.file_uploader(
-            "Arquivos de Retorno (.ret)",
+            "Arquivos de Retorno (.ret) - obrigatório para conciliação",
             type=["ret"],
             accept_multiple_files=True,
             key="ret"
         )
     with col2:
         rem_files = st.file_uploader(
-            "Arquivos de Remessa (.rem) [opcional]",
+            "Arquivos de Remessa (.rem) - obrigatório para conciliação",
             type=["rem"],
             accept_multiple_files=True,
             key="rem"
@@ -61,6 +61,8 @@ with tab1:
     if st.button("Processar Conciliação", type="primary"):
         if not ret_files:
             st.error("Pelo menos um arquivo de retorno é obrigatório.")
+        elif not rem_files:
+            st.error("Pelo menos um arquivo de remessa é obrigatório.")
         elif not pasta_destino.strip():
             st.error("Informe uma pasta de destino.")
         else:
