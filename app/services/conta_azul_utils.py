@@ -4,9 +4,11 @@ import requests
 from sqlalchemy import text
 from .conta_azul import _get_valid_access_token
 from app.services.cache_sync import SessionLocal
-from sqlalchemy import text
-from app.db import engine  # ou de onde você importa o seu engine do SQLAlchemy
+import os
+from sqlalchemy import create_engine
 
+DATABASE_URL = os.getenv("DATABASE_URL")
+engine = create_engine(DATABASE_URL)
 logger = logging.getLogger(__name__)
 
 def obter_configuracao():

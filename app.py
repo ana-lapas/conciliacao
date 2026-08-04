@@ -50,7 +50,9 @@ engine = create_engine(DATABASE_URL)
 
 # --- GARANTE A CRIAÇÃO DA TABELA DE CONFIGURAÇÕES DO CONTA AZUL (PONTO D) ---
 # Executa um DDL atômico para impedir erros caso o banco seja zerado ou reiniciado
+# No bloco 1 do app.py (Início da aplicação):
 with engine.begin() as conn:
+    # Garante a tabela de configuração do Conta Azul
     conn.execute(
         text("""
             CREATE TABLE IF NOT EXISTS conta_azul_config (
@@ -61,6 +63,11 @@ with engine.begin() as conn:
             );
         """)
     )
+    
+    # Garante as colunas em payment_match se não existirem
+    conn.execute(text("ALTER TABLE payment_match ADD COLUMN IF NOT EXISTS nome_aluno VARCHAR(255);"))
+    conn.execute(text("ALTER TABLE payment_match ADD COLUMN IF NOT EXISTS descricao_pagamento TEXT;"))
+    conn.execute(text("ALTER TABLE payment_match ADD COLUMN IF NOT EXISTS data_vencimento DATE;"))
 
 # -----------------------------------------------------------------------------
 # 2. DASHBOARDS E MÉTRICAS (Roda a cada refresh da página)
