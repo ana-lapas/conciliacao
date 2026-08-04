@@ -45,19 +45,36 @@ def definir_configuracao(conta_financeira_id: str, categoria_id: str):
 
 def obter_ou_criar_contato(nome: str) -> str:
     """Retorna o UUID do contato (cliente) no Conta Azul.
-    Se não existir no banco local, busca na API e cria se necessário.
+    
+    Se não existir no banco local, busca na API do Conta Azul e cria se necessário.
+    Garante resiliência criando a tabela 'conta_azul_contato' caso não exista.
     """
     nome = nome.strip().upper()
     session = SessionLocal()
     try:
+        # Garante a existência da tabela de mapeamento local no PostgreSQL
+        session.execute(
+            text("""
+                CREATE TABLE IF NOT EXISTS public.conta_azul_contato (
+                    id SERIAL PRIMARY KEY,
+                    nome VARCHAR(255) NOT NULL UNIQUE,
+                    contato_uuid VARCHAR(255) NOT NULL,
+                    criado_em TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+        )
+        session.commit()
+
+        # 1. Tenta buscar no banco de dados local (Cache)
         row = session.execute(
             text("SELECT contato_uuid FROM conta_azul_contato WHERE nome = :nome"),
             {"nome": nome}
         ).first()
+        
         if row:
             return row.contato_uuid
 
-        # Buscar na API
+        # 2. Busca na API do Conta Azul se não encontrar localmente
         token = _get_valid_access_token()
         resp = requests.get(
             "https://api-v2.contaazul.com/v1/pessoas",
@@ -66,29 +83,42 @@ def obter_ou_criar_contato(nome: str) -> str:
         )
         resp.raise_for_status()
         pessoas = resp.json()
+        
         if pessoas:
             uuid = pessoas[0]["id"]
         else:
-            # Criar novo contato
-            payload = {"nome": nome, "tipo": "FISICA"}  # assumindo pessoa física
+            # 3. Se não existir no Conta Azul, cria o novo cadastro (Pessoa Física)
+            payload = {"nome": nome, "tipo": "FISICA"}
             resp = requests.post(
                 "https://api-v2.contaazul.com/v1/pessoas",
-                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json"
+                },
                 json=payload
             )
             resp.raise_for_status()
             uuid = resp.json()["id"]
 
-        # Salvar mapeamento local
+        # 4. Salva o mapeamento no banco local para chamadas futuras
         session.execute(
-            text("INSERT INTO conta_azul_contato (nome, contato_uuid) VALUES (:nome, :uuid) ON CONFLICT DO NOTHING"),
+            text("""
+                INSERT INTO conta_azul_contato (nome, contato_uuid)
+                VALUES (:nome, :uuid)
+                ON CONFLICT (nome) DO NOTHING;
+            """),
             {"nome": nome, "uuid": uuid}
         )
         session.commit()
         return uuid
+        
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Erro ao obter/criar contato no Conta Azul: {e}")
+        raise e
     finally:
         session.close()
-
+        
 def obter_ou_criar_categoria(nome: str = "Recebimentos") -> str:
     token = _get_valid_access_token()
     # Buscar categoria pelo nome e tipo RECEITA
