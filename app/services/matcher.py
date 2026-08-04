@@ -1,16 +1,6 @@
 # services/matcher.py
 """
-Módulo de Conciliação Financeira Automatizada.
-
-Este módulo é o coração da integração entre o Retorno Bancário (CNAB 400 Bradesco),
-o histórico de Remessas, o banco de dados do Sophia ERP e a API do Conta Azul.
-
-FLUXO EXECUTIVO:
-1. Lê retornos em aberto ('PENDENTE' ou 'PENDENTE_REVISAO').
-2. Realiza o De-Para com o arquivo de Remessa usando o Nosso Número como chave.
-3. Localiza o responsável financeiro no cache local (student_responsible).
-4. Valida o título no Sofia ERP (via API) batendo número do boleto, valor e vencimento.
-5. Registra o match definitivo e envia a liquidação ao Conta Azul.
+Módulo de Conciliação Financeira Automatizada (Bradesco CNAB 400).
 """
 
 import logging
@@ -28,31 +18,22 @@ from app.services.conta_azul_receitas import criar_receita_com_baixa
 logger = logging.getLogger(__name__)
 
 # ==============================================================================
-# FUNÇÕES AUXILIARES DE SANITIZAÇÃO DE DADOS
+# SANITIZAÇÃO DE DADOS
 # ==============================================================================
 
 def normalizar_nosso_numero(nn: str) -> str:
     """
-    Remove zeros à esquerda e caracteres não numéricos.
-    
-    Motivo: O Bradesco grava no arquivo remessa/retorno o número '000000094851' (11 dígitos
-    com pad de zeros), enquanto a API REST do Sofia e as interfaces de banco salvam '94851'.
-    Esta função iguala ambas as pontas para permitir comparação direta de strings.
+    Remove zeros à esquerda e caracteres não numéricos para igualar com as APIs.
     """
     if not nn:
         return ""
-    # Remove qualquer caractere que não seja dígito numérico (ex: traços ou pontos)
     apenas_numeros = re.sub(r'\D', '', str(nn))
-    # lstrip('0') remove os zeros do início sem alterar zeros internos (ex: '00101' vira '101')
     return apenas_numeros.lstrip('0')
 
 
 def normalizar_texto(texto: str) -> str:
     """
-    Padroniza strings de texto para comparação segura em caixa alta.
-    
-    Realiza o trim de bordas, converte para UPPER e substitui múltiplos espaços em
-    branco internos por um único espaço. Evita que 'MARIA  SILVA' seja diferente de 'MARIA SILVA'.
+    Padroniza strings de texto para comparação segura em caixa alta com trim.
     """
     if not texto:
         return ""
@@ -65,13 +46,8 @@ def normalizar_texto(texto: str) -> str:
 
 def buscar_responsaveis(session: Session, nome: Optional[str] = None, cpf: Optional[str] = None) -> List[Dict[str, Any]]:
     """
-    Localiza os responsáveis financeiros na tabela local `student_responsible`.
-    
-    Estratégia de Busca:
-    1. Prioridade pelo CPF (limpo de pontuação).
-    2. Fallback pelo Nome Completo ou Parcial (Primeiro Nome + Sobrenome).
+    Localiza os responsáveis financeiros na tabela local por CPF ou Nome.
     """
-    # 1. Tentativa de match por CPF (100% de precisão)
     if cpf:
         cpf_limpo = re.sub(r'\D', '', str(cpf))
         query = text("""
@@ -84,7 +60,6 @@ def buscar_responsaveis(session: Session, nome: Optional[str] = None, cpf: Optio
         if rows:
             return [dict(row._mapping) for row in rows]
 
-    # 2. Tentativa de match por Nome (tolerante a divergências de sobrenome)
     if nome:
         nome_limpo = normalizar_texto(nome)
         partes = nome_limpo.split()
@@ -108,10 +83,7 @@ def buscar_responsaveis(session: Session, nome: Optional[str] = None, cpf: Optio
 
 def obter_remessa_por_nosso_numero(session: Session, nosso_numero: str):
     """
-    Realiza a busca da Remessa original no banco pelo Nosso Número.
-    
-    Utiliza a função `LTRIM(nosso_numero, '0')` no SQL do PostgreSQL para garantir que
-    registros salvos com ou sem zeros à esquerda sejam encontrados corretamente.
+    Busca a Remessa original pelo Nosso Número normalizado.
     """
     nn_limpo = normalizar_nosso_numero(nosso_numero)
     query = text("""
@@ -125,8 +97,7 @@ def obter_remessa_por_nosso_numero(session: Session, nosso_numero: str):
 
 def obter_descricao_pagamento(session: Session, nosso_numero: str) -> Optional[str]:
     """
-    Recupera as mensagens descritivas do Registro Tipo 2 (opcional) enviado na Remessa.
-    Concatena as 4 mensagens em uma única linha para compor o histórico no Conta Azul.
+    Recupera as mensagens do Registro Tipo 2 vinculadas para compor o histórico.
     """
     nn_limpo = normalizar_nosso_numero(nosso_numero)
     row = session.execute(
@@ -142,13 +113,12 @@ def obter_descricao_pagamento(session: Session, nosso_numero: str) -> Optional[s
     if not row:
         return None
     
-    # Junta apenas as linhas de mensagens que não estiverem vazias
     partes = [row.mensagem1, row.mensagem2, row.mensagem3, row.mensagem4]
     return " | ".join(p.strip() for p in partes if p and p.strip())
 
 
 # ==============================================================================
-# LÓGICA DE MATCHING FINANCEIRO (SOFIA API)
+# LÓGICA DE MATCHING FINANCEIRO (CHAVE PRINCIPAL + VALOR)
 # ==============================================================================
 
 def encontrar_lancamento(
@@ -156,21 +126,14 @@ def encontrar_lancamento(
     valor_pago: float, data_pagamento: Any
 ) -> Optional[Dict[str, Any]]:
     """
-    Consulta a API do Sofia para localizar o lançamento aberto que bate com o pagamento.
-    
-    Critérios de Validação:
-    - O lançamento deve estar em aberto (`recebido == 0`).
-    - Prioridade 1: Match exato pelo `numeroBoleto`.
-    - Prioridade 2: Match por proximidade de valor (tolerância R$ 0,01) e data de vencimento (janela de 5 dias).
+    Valida o lançamento em aberto cruzando o Nosso Número e tolerância de valor/vencimento.
     """
     try:
-        # Busca lançamentos vinculados ao ID do aluno no Sofia
         lancamentos = api.obter_lancamentos(student_id)
     except Exception as e:
         logger.error(f"Erro ao obter lançamentos do aluno {student_id}: {e}")
         return None
 
-    # Normaliza o tipo do parâmetro data_pagamento para garantir compatibilidade
     if isinstance(data_pagamento, datetime):
         data_pgto = data_pagamento
     else:
@@ -181,26 +144,24 @@ def encontrar_lancamento(
     melhor_diferenca = timedelta.max
 
     for lanc in lancamentos:
-        # Descarta parcelas que já foram marcadas como recebidas
         if lanc.get("recebido") != 0:
             continue
 
-        # 1. Teste do Nosso Número no boleto (Match Direto)
+        # 1. Match Direto pelo Nosso Número
         num_boleto_api = normalizar_nosso_numero(str(lanc.get("numeroBoleto", "")))
         if num_boleto_api and num_boleto_api == nn_limpo:
             return lanc
 
-        # 2. Teste do Valor Previsto vs Valor Pago
+        # 2. Validação por Valor (tolerância de R$ 0,01 para juros/descontos)
         try:
             valor_previsto = float(lanc.get("valorPrevisto", 0))
         except (TypeError, ValueError):
             continue
 
-        # Tolerância de 1 centavo para variações de arredondamento
         if abs(valor_previsto - valor_pago) > 0.01:
             continue
 
-        # 3. Teste de Proximidade da Data de Vencimento (Tolerância para liquidação com atraso/antecipação)
+        # 3. Validação por Proximidade de Vencimento (janela de 5 dias)
         try:
             data_venc = datetime.strptime(str(lanc.get("dataVencimento", ""))[:10], '%Y-%m-%d')
         except (ValueError, TypeError):
@@ -215,16 +176,15 @@ def encontrar_lancamento(
 
 
 # ==============================================================================
-# GRAVAÇÃO DE RESULTADOS E INTEGRAÇÃO EXTERNA
+# PERSISTÊNCIA E INTEGRAÇÃO EXTERNA
 # ==============================================================================
 
 def registrar_conciliacao(session: Session, ret, rem, resp: dict, lanc: dict) -> None:
     """
-    Efetiva a conciliação: atualiza o status local para CONCILIADO e envia a receita baixada para o Conta Azul.
+    Efetiva a conciliação localmente e dispara a baixa no Conta Azul com tratamento defensivo.
     """
     nome = normalizar_texto(resp.get('nome')) or "NÃO INFORMADO"
 
-    # Verifica se já existe um registro na tabela payment_match para evitar duplicações
     existente = session.execute(
         text("SELECT id FROM payment_match WHERE retorno_id = :rid"),
         {"rid": ret.id}
@@ -270,18 +230,16 @@ def registrar_conciliacao(session: Session, ret, rem, resp: dict, lanc: dict) ->
             """), params_match
         )
 
-    # Atualiza o ciclo de vida das tabelas filhas para CONCILIADO e PAGO
     session.execute(text("UPDATE retorno SET status = 'CONCILIADO' WHERE id = :rid"), {"rid": ret.id})
     if rem:
         session.execute(text("UPDATE remessa SET status = 'PAGO' WHERE id = :remid"), {"remid": rem.id})
 
-    # Disparo de baixa imediata na API do Conta Azul
+    # Integração Conta Azul com Tratamento Defensivo de Erros
     descricao_remessa = obter_descricao_pagamento(session, ret.nosso_numero)
     try:
         data_pgto_str = ret.data_pagamento.strftime('%Y-%m-%d') if isinstance(ret.data_pagamento, datetime) else str(ret.data_pagamento)[:10]
         descricao_completa = f"{descricao_remessa or 'Mensalidade Escolar'} - Resp: {nome}"
         
-        # Cria a conta a receber e realiza o POST de baixa no ERP Conta Azul
         parcela_id = criar_receita_com_baixa(
             data_vencimento=data_pgto_str,
             valor=float(ret.valor_pago),
@@ -290,7 +248,6 @@ def registrar_conciliacao(session: Session, ret, rem, resp: dict, lanc: dict) ->
             data_pagamento=data_pgto_str
         )
         
-        # Salva o UUID da parcela retornada pelo Conta Azul para rastreabilidade
         session.execute(
             text("UPDATE payment_match SET conta_azul_receita_id = :caid WHERE retorno_id = :rid"),
             {"caid": parcela_id, "rid": ret.id}
@@ -298,7 +255,6 @@ def registrar_conciliacao(session: Session, ret, rem, resp: dict, lanc: dict) ->
         logger.info(f"Retorno {ret.id} CONCILIADO e enviado ao Conta Azul (ID Parcela: {parcela_id})")
         
     except Exception as e:
-        # Tratamento Defensivo: Em caso de falha da API externa, o log é gravado sem derrubar a transação local
         logger.error(f"Falha na integração Conta Azul para o retorno {ret.id}: {e}")
         session.execute(
             text("UPDATE payment_match SET mensagem = :msg WHERE retorno_id = :rid"),
@@ -308,7 +264,7 @@ def registrar_conciliacao(session: Session, ret, rem, resp: dict, lanc: dict) ->
 
 def registrar_pendente_revisao(session: Session, ret, mensagem: str, nome_pagador: Optional[str] = None) -> None:
     """
-    Registra pendência de revisão manual caso o pagamento não consiga ser reconciliado sozinho.
+    Registra pendência de revisão manual em caso de falha de match.
     """
     nome = normalizar_texto(nome_pagador) if nome_pagador else f"PAGADOR NÃO IDENTIFICADO – Nosso Número {ret.nosso_numero}"
 
@@ -335,17 +291,15 @@ def registrar_pendente_revisao(session: Session, ret, mensagem: str, nome_pagado
 
 
 # ==============================================================================
-# FUNÇÃO PRINCIPAL DE ORQUESTRAÇÃO
+# ORQUESTRAÇÃO PRINCIPAL
 # ==============================================================================
 
 def conciliar_retorno(api: SofiaAPI) -> None:
     """
-    Ponto de entrada principal para a execução em lote da conciliação.
-    Itera sobre todos os retornos pendentes e executa a esteira de validação.
+    Orquestra a esteira de conciliação em lote para todos os retornos pendentes.
     """
     session = SessionLocal()
     try:
-        # Carrega os registros pendentes de processamento
         retornos = session.execute(
             text("SELECT * FROM retorno WHERE status IN ('PENDENTE', 'PENDENTE_REVISAO')")
         ).fetchall()
@@ -357,39 +311,24 @@ def conciliar_retorno(api: SofiaAPI) -> None:
         logger.info(f"Iniciando conciliação de {len(retornos)} retornos...")
 
         for ret in retornos:
-            # PASSO 1: Busca a Remessa correspondente usando o Nosso Número
             rem = obter_remessa_por_nosso_numero(session, ret.nosso_numero)
 
             if not rem:
-                registrar_pendente_revisao(
-                    session, ret,
-                    f"Remessa não localizada para o Nosso Número {ret.nosso_numero}."
-                )
+                registrar_pendente_revisao(session, ret, f"Remessa não localizada para o Nosso Número {ret.nosso_numero}.")
                 continue
 
             nome_busca = normalizar_texto(rem.nome_pagador)
             cpf_busca = rem.cpf_pagador
 
-            # PASSO 2: Valida se a remessa possui o nome do pagador
             if not nome_busca or nome_busca.isdigit():
-                registrar_pendente_revisao(
-                    session, ret,
-                    "Nome do pagador inválido na remessa.",
-                    nome_pagador=None
-                )
+                registrar_pendente_revisao(session, ret, "Nome do pagador inválido na remessa.", nome_pagador=None)
                 continue
 
-            # PASSO 3: Localiza os responsáveis financeiros cadastrados no cache do banco
             resp_rows = buscar_responsaveis(session, nome=nome_busca, cpf=cpf_busca)
             if not resp_rows:
-                registrar_pendente_revisao(
-                    session, ret,
-                    f"Responsável '{nome_busca}' não localizado no banco local.",
-                    nome_pagador=nome_busca
-                )
+                registrar_pendente_revisao(session, ret, f"Responsável '{nome_busca}' não localizado no banco local.", nome_pagador=nome_busca)
                 continue
 
-            # PASSO 4: Consulta a API do Sofia para bater o lançamento em aberto
             match_resp = None
             match_lanc = None
             for resp in resp_rows:
@@ -402,22 +341,15 @@ def conciliar_retorno(api: SofiaAPI) -> None:
                     match_lanc = lanc
                     break
 
-            # PASSO 5: Conclui a conciliação ou registra pendência para análise manual na tela
             if match_resp and match_lanc:
                 registrar_conciliacao(session, ret, rem, match_resp, match_lanc)
             else:
-                registrar_pendente_revisao(
-                    session, ret,
-                    "Lançamento financeiro não localizado no Sofia.",
-                    nome_pagador=nome_busca
-                )
+                registrar_pendente_revisao(session, ret, "Lançamento financeiro não localizado no Sofia.", nome_pagador=nome_busca)
 
-        # Efetiva todas as operações no banco PostgreSQL
         session.commit()
         logger.info("Processo de conciliação finalizado com sucesso.")
         
     except Exception:
-        # Em caso de erro não tratado, desfaz as operações para manter a integridade dos dados
         session.rollback()
         logger.exception("Erro crítico durante a conciliação. Rollback executado.")
         raise

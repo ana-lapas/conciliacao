@@ -22,7 +22,8 @@ SessionLocal = sessionmaker(bind=engine)
 
 def sincronizar_remessa(caminho_rem: str):
     """
-    Lê um arquivo de remessa e insere/atualiza os registros no banco.
+    Lê um arquivo de remessa e insere/atualiza os registros e mensagens no banco de dados
+    utilizando operações em lote (upsert) para performance e integridade.
     """
     reader = RemessaReader(caminho_rem)
     registros = reader.processar()
@@ -32,60 +33,86 @@ def sincronizar_remessa(caminho_rem: str):
 
     session = SessionLocal()
     try:
+        # Inicia uma transação explícita
+        with session.begin():
         # Prepara os dados para executemany
-        dados_para_insert = []
-        for r in registros:
-            dados_para_insert.append({
-                "nosso_numero": r["nosso_numero"],
-                "nome_pagador": r["nome_pagador"],
-                "cpf_pagador": r.get("cpf"),   # pode ser None
-                "valor": r["valor"],
-                "data_vencimento": r["vencimento"],
-                "arquivo_origem": caminho_rem,
-                "status": "PENDENTE"
-            })
-
-        # Upsert em lote: ON CONFLICT (nosso_numero) DO UPDATE
-        session.execute(
-            text("""
-                INSERT INTO remessa (nosso_numero, nome_pagador, cpf_pagador, valor, data_vencimento, arquivo_origem, status)
-                VALUES (:nosso_numero, :nome_pagador, :cpf_pagador, :valor, :data_vencimento, :arquivo_origem, :status)
-                ON CONFLICT (nosso_numero) DO UPDATE SET
-                    nome_pagador = EXCLUDED.nome_pagador,
-                    cpf_pagador = EXCLUDED.cpf_pagador,
-                    valor = EXCLUDED.valor,
-                    data_vencimento = EXCLUDED.data_vencimento,
-                    arquivo_origem = EXCLUDED.arquivo_origem,
-                    sincronizado_em = NOW()
-            """),
-            dados_para_insert
-        )
-        # Sincronizar mensagens (tipo 2)
-        if reader.mensagens:
-            mensagens_insert = []
-            for msg in reader.mensagens:
-                mensagens_insert.append({
-                    "nosso_numero": msg["nosso_numero"],
-                    "mensagem1": msg["mensagem1"],
-                    "mensagem2": msg["mensagem2"],
-                    "mensagem3": msg["mensagem3"],
-                    "mensagem4": msg["mensagem4"],
+            dados_para_insert = []
+            for r in registros:
+                if not r.get("nosso_numero"):
+                     continue  # Ignora registros inválidos sem Nosso Número
+                dados_para_insert.append({
+                    "nosso_numero": r["nosso_numero"],
+                    "dac": r.get("dac"),
+                    "nome_pagador": r["nome_pagador"],
+                    "cpf_pagador": r.get("cpf"),   # pode ser None
+                    "valor": r["valor"],
+                    "data_vencimento": r["vencimento"],
+                    "arquivo_origem": caminho_rem,
+                    "status": "PENDENTE"
                 })
+                
+            if dados_para_insert:
+                    # Inserção atualizada para contemplar a coluna dac
+                    session.execute(
+                        text("""
+                            INSERT INTO remessa (nosso_numero, dac, nome_pagador, cpf_pagador, valor, data_vencimento, arquivo_origem, status)
+                            VALUES (:nosso_numero, :dac, :nome_pagador, :cpf_pagador, :valor, :data_vencimento, :arquivo_origem, :status)
+                            ON CONFLICT (nosso_numero) DO UPDATE SET
+                                dac = EXCLUDED.dac,
+                                nome_pagador = EXCLUDED.nome_pagador,
+                                cpf_pagador = EXCLUDED.cpf_pagador,
+                                valor = EXCLUDED.valor,
+                                data_vencimento = EXCLUDED.data_vencimento,
+                                arquivo_origem = EXCLUDED.arquivo_origem,
+                                sincronizado_em = NOW()
+                        """),
+                        dados_para_insert
+                    )
+                    logger.info(f"Remessa sincronizada com sucesso: {len(dados_para_insert)} títulos processados com DAC.")
+            # Upsert em lote: ON CONFLICT (nosso_numero) DO UPDATE
             session.execute(
                 text("""
-                    INSERT INTO remessa_mensagem (nosso_numero, mensagem1, mensagem2, mensagem3, mensagem4)
-                    VALUES (:nosso_numero, :mensagem1, :mensagem2, :mensagem3, :mensagem4)
+                    INSERT INTO remessa (nosso_numero, dac, nome_pagador, cpf_pagador, valor, data_vencimento, arquivo_origem, status)
+                    VALUES (:nosso_numero, :dac, :nome_pagador, :cpf_pagador, :valor, :data_vencimento, :arquivo_origem, :status)
                     ON CONFLICT (nosso_numero) DO UPDATE SET
-                        mensagem1 = EXCLUDED.mensagem1,
-                        mensagem2 = EXCLUDED.mensagem2,
-                        mensagem3 = EXCLUDED.mensagem3,
-                        mensagem4 = EXCLUDED.mensagem4
+                        dac = EXCLUDED.dac,
+                        nome_pagador = EXCLUDED.nome_pagador,
+                        cpf_pagador = EXCLUDED.cpf_pagador,
+                        valor = EXCLUDED.valor,
+                        data_vencimento = EXCLUDED.data_vencimento,
+                        arquivo_origem = EXCLUDED.arquivo_origem,
+                        sincronizado_em = NOW()
                 """),
-                mensagens_insert
+                dados_para_insert
             )
-            logger.info(f"Mensagens sincronizadas: {len(reader.mensagens)} registros.")
-        session.commit()
-        logger.info(f"Remessa sincronizada: {len(registros)} registros.")
+            
+            # Sincronizar mensagens (tipo 2)
+            if reader.mensagens:
+                mensagens_insert = []
+                for msg in reader.mensagens:
+                    mensagens_insert.append({
+                        "nosso_numero": msg["nosso_numero"],
+                        "mensagem1": msg["mensagem1"],
+                        "mensagem2": msg["mensagem2"],
+                        "mensagem3": msg["mensagem3"],
+                        "mensagem4": msg["mensagem4"],
+                    })
+                session.execute(
+                    text("""
+                        INSERT INTO remessa_mensagem (nosso_numero, mensagem1, mensagem2, mensagem3, mensagem4)
+                        VALUES (:nosso_numero, :mensagem1, :mensagem2, :mensagem3, :mensagem4)
+                        ON CONFLICT (nosso_numero) DO UPDATE SET
+                            mensagem1 = EXCLUDED.mensagem1,
+                            mensagem2 = EXCLUDED.mensagem2,
+                            mensagem3 = EXCLUDED.mensagem3,
+                            mensagem4 = EXCLUDED.mensagem4
+                    """),
+                    mensagens_insert
+                )
+                logger.info(f"Mensagens sincronizadas: {len(reader.mensagens)} registros.")
+                
+            session.commit()
+            logger.info(f"Remessa sincronizada: {len(registros)} registros.")
     except Exception:
         session.rollback()
         logger.exception("Erro ao sincronizar remessa.")

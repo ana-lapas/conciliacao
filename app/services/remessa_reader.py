@@ -13,11 +13,12 @@ class RemessaReader:
     """
     
     LAYOUT = {
-        "nosso_numero": (71, 82),
-        "valor_titulo": (126, 139),
+        "nosso_numero": (70, 81),
+        "dac_nosso_numero": (81, 82),
         "data_vencimento": (120, 126),
+        "valor_titulo": (126, 139),
+        "cpf_pagador": (220, 234),        
         "nome_pagador": (234, 274),
-        "cpf_pagador": (220, 234),
     }
 
     def __init__(self, file_path):
@@ -32,11 +33,18 @@ class RemessaReader:
 
     def _processar_mensagem(self, linha):
         """
-        Extrai as 4 mensagens do registro tipo 2 e o nosso número (posições 383 a 394).
+        Extrai as 4 mensagens do registro tipo 2, o nosso número e o DAC (posições 383 a 394).
         """
-        nosso_numero_raw = linha[382:394].strip()
+        # Posições 383 a 393: Nosso Número (11 posições)[cite: 1]
+        nosso_numero_raw = linha[382:393].strip()
+        nosso_numero = nosso_numero_raw.lstrip('0') if nosso_numero_raw else ""
+        
+        # Posição 394: DAC do Nosso Número (1 posição - numérico ou 'P')[cite: 1]
+        dac = linha[393:394].strip()
+
         return {
-            "nosso_numero": nosso_numero_raw.lstrip('0') if nosso_numero_raw else "",
+            "nosso_numero": nosso_numero,
+            "dac": dac,
             "mensagem1": linha[1:81].strip(),
             "mensagem2": linha[81:161].strip(),
             "mensagem3": linha[161:241].strip(),
@@ -72,15 +80,18 @@ class RemessaReader:
     def _processar_registro_tipo_1(self, linha, num_linha):
         """Processa e valida internamente um registro do tipo 1."""
         try:
-            # Extrai e limpa os zeros à esquerda do Nosso Número (Pág. 16)
+            # Extração correta do Nosso Número sem misturar com o DAC e removendo zeros à esquerda
             nosso_numero_raw = self._extrair_campo(linha, *self.LAYOUT["nosso_numero"])
+            dac_raw = self._extrair_campo(linha, *self.LAYOUT["dac_nosso_numero"])
+            
+            # Padronização limpa para bater com o arquivo de retorno
             nosso_numero = nosso_numero_raw.lstrip('0') if nosso_numero_raw else ""
 
-            # Conversão de Valor (Pág. 9 - posições 127 a 139)
+            # Conversão de Valor (Posições 127 a 139)[cite: 1]
             valor_raw = self._extrair_campo(linha, *self.LAYOUT["valor_titulo"])
             valor_processado = float(valor_raw) / 100
 
-            # Formatação de Data de Vencimento DDMMAA (Pág. 9 - posições 121 a 126)
+            # Formatação de Data de Vencimento DDMMAA (Posições 121 a 126)[cite: 1]
             data_raw = self._extrair_campo(linha, *self.LAYOUT["data_vencimento"])
             data_formatada = datetime.strptime(data_raw, '%d%m%y').strftime('%Y-%m-%d')
 
@@ -91,12 +102,13 @@ class RemessaReader:
                 if len(cpf_raw) in (11, 14):
                     cpf = cpf_raw
 
-            # Normalização do Nome do Pagador (Pág. 9 - posições 235 a 274)
+            # Normalização do Nome do Pagador (Posições 235 a 274)[cite: 1]
             nome_raw = self._extrair_campo(linha, *self.LAYOUT["nome_pagador"])
             nome_pagador = " ".join(nome_raw.upper().split()) if nome_raw else ""
 
             registro = {
                 "nosso_numero": nosso_numero,
+                "dac": dac_raw,
                 "nome_pagador": nome_pagador,
                 "cpf": cpf,
                 "valor": valor_processado,
@@ -105,13 +117,14 @@ class RemessaReader:
             }
             self.registros.append(registro)
             
-            logging.debug(f"Linha {num_linha}: Processado pagador {registro['nome_pagador']} | N/N: {nosso_numero}")
+            logging.debug(f"Linha {num_linha}: Processado pagador {registro['nome_pagador']} | N/N: {nosso_numero}-{dac_raw}")
             
         except ValueError as e:
             msg_erro = f"Linha {num_linha}: Erro ao processar dados da linha. Detalhe: {e}"
             logging.warning(msg_erro)
             self.erros.append(msg_erro)
-            
+
+    # Função utilitária externa corrigida e alinhada ao escopo global
     def carregar_remessa(caminho_rem):
         if not caminho_rem:
             return {}
