@@ -43,16 +43,19 @@ def definir_configuracao(conta_financeira_id: str, categoria_id: str):
             {"conta_id": conta_financeira_id, "cat_id": categoria_id}
         )
 
-def obter_ou_criar_contato(nome: str, cpf: str = None) -> str:
-    """Retorna o UUID do contato (cliente) no Conta Azul.
+import logging
+import requests
+from sqlalchemy import text
+from .conta_azul import _get_valid_access_token
 
-    Se não existir no banco local, busca na API. Se não encontrar,
-    cria a pessoa respeitando a documentação da API v2 do Conta Azul.
-    """
+logger = logging.getLogger(__name__)
+
+def obter_ou_criar_contato(nome: str, cpf: str = None) -> str:
+    """Retorna o UUID do contato (cliente) no Conta Azul."""
     nome = nome.strip().upper()
     session = SessionLocal()
     try:
-        # 1. Garante resiliência criando a tabela se não existir
+        # 1. Garante a criação da tabela local
         session.execute(
             text("""
                 CREATE TABLE IF NOT EXISTS public.conta_azul_contato (
@@ -65,7 +68,7 @@ def obter_ou_criar_contato(nome: str, cpf: str = None) -> str:
         )
         session.commit()
 
-        # 2. Busca no banco de dados local (Cache)
+        # 2. Busca no banco de dados local
         row = session.execute(
             text("SELECT contato_uuid FROM conta_azul_contato WHERE nome = :nome"),
             {"nome": nome}
@@ -74,7 +77,7 @@ def obter_ou_criar_contato(nome: str, cpf: str = None) -> str:
         if row:
             return row.contato_uuid
 
-        # 3. Busca na API do Conta Azul pelo nome
+        # 3. Busca na API do Conta Azul
         token = _get_valid_access_token()
         headers = {
             "Authorization": f"Bearer {token}",
@@ -92,7 +95,7 @@ def obter_ou_criar_contato(nome: str, cpf: str = None) -> str:
         if pessoas:
             uuid = pessoas[0]["id"]
         else:
-            # 4. Criar novo contato montando apenas os campos existentes
+            # 4. Criar novo contato (apenas os campos estritamente necessários)
             payload = {
                 "nome": nome,
                 "tipo_pessoa": "Física",
@@ -103,7 +106,6 @@ def obter_ou_criar_contato(nome: str, cpf: str = None) -> str:
                 ]
             }
 
-            # Envia o CPF apenas se estiver presente e preenchido
             if cpf and cpf.strip():
                 payload["cpf"] = cpf.strip()
 
@@ -112,15 +114,10 @@ def obter_ou_criar_contato(nome: str, cpf: str = None) -> str:
                 headers=headers,
                 json=payload
             )
-
-            # Tratamento detalhado de erro para evitar logs sem contexto
-            if not resp_post.ok:
-                logger.error(f"Erro no POST /v1/pessoas ({resp_post.status_code}): {resp_post.text}")
-                resp_post.raise_for_status()
-
+            resp_post.raise_for_status()
             uuid = resp_post.json()["id"]
 
-        # 5. Salva no banco local
+        # 5. Salva o mapeamento no banco local
         session.execute(
             text("""
                 INSERT INTO conta_azul_contato (nome, contato_uuid)
@@ -132,13 +129,41 @@ def obter_ou_criar_contato(nome: str, cpf: str = None) -> str:
         session.commit()
         return uuid
 
+    except requests.exceptions.HTTPError as http_err:
+        session.rollback() # Limpa a transação que falhou
+        
+        status_code = http_err.response.status_code if http_err.response is not None else None
+        body_text = http_err.response.text if http_err.response is not None else "Sem resposta"
+        
+        logger.error(f"Erro HTTP {status_code} na API Conta Azul ao criar/obter contato. Detalhes: {body_text}")
+        
+        # Persiste o erro de forma independente no banco
+        registrar_log_erro(
+            servico="obter_ou_criar_contato",
+            status_code=status_code,
+            resposta_erro=body_text,
+            payload={"nome": nome, "cpf": cpf}
+        )
+        
+        raise http_err
+
     except Exception as e:
         session.rollback()
-        logger.error(f"Erro ao obter/criar contato no Conta Azul: {e}")
+        erro_msg = f"{type(e).__name__}: {str(e)}"
+        logger.error(f"Erro inesperado ao obter/criar contato no Conta Azul: {erro_msg}")
+        
+        # Persiste exceções genéricas
+        registrar_log_erro(
+            servico="obter_ou_criar_contato",
+            status_code=None,
+            resposta_erro=erro_msg,
+            payload={"nome": nome, "cpf": cpf}
+        )
+        
         raise e
     finally:
         session.close()
-          
+
 def obter_ou_criar_categoria(nome: str = "Recebimentos") -> str:
     token = _get_valid_access_token()
     # Buscar categoria pelo nome e tipo RECEITA
@@ -178,6 +203,43 @@ def listar_contas_financeiras():
     resp.raise_for_status()
     contas = resp.json().get("itens", [])
     return [{"id": c["id"], "nome": c["nome"]} for c in contas]
+
+def registrar_log_erro(servico: str, status_code: int | None, resposta_erro: str, payload: dict | str = None):
+    """Grava o erro de integração em uma transação isolada no PostgreSQL."""
+    session_log = SessionLocal()
+    try:
+        # Garante resiliência criando a tabela de log se não existir
+        session_log.execute(
+            text("""
+                CREATE TABLE IF NOT EXISTS public.conta_azul_log (
+                    id SERIAL PRIMARY KEY,
+                    servico VARCHAR(100) NOT NULL,
+                    status_code INT NULL,
+                    payload_enviado TEXT NULL,
+                    resposta_erro TEXT NULL,
+                    criado_em TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+        )
+        
+        session_log.execute(
+            text("""
+                INSERT INTO conta_azul_log (servico, status_code, payload_enviado, resposta_erro)
+                VALUES (:servico, :status_code, :payload, :resposta);
+            """),
+            {
+                "servico": servico,
+                "status_code": status_code if isinstance(status_code, int) else None,
+                "payload": str(payload) if payload else None,
+                "resposta": resposta_erro
+            }
+        )
+        session_log.commit()
+    except Exception as log_err:
+        session_log.rollback()
+        logger.error(f"Falha ao persistir log de erro no DB: {log_err}")
+    finally:
+        session_log.close()
 
 def traduzir_erro_para_usuario(exception: Exception) -> str:
     """Converte uma exceção técnica em uma mensagem clara para a secretária."""
