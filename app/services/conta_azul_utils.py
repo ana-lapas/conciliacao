@@ -4,39 +4,43 @@ import requests
 from sqlalchemy import text
 from .conta_azul import _get_valid_access_token
 from app.services.cache_sync import SessionLocal
+from sqlalchemy import text
+from app.db import engine  # ou de onde você importa o seu engine do SQLAlchemy
 
 logger = logging.getLogger(__name__)
 
 def obter_configuracao():
-    """Busca os UUIDs de conta e categoria do banco."""
-    session = SessionLocal()
-    try:
-        row = session.execute(
-            text("SELECT conta_financeira, categoria FROM conta_azul_config ORDER BY id LIMIT 1")
+    """
+    Busca a configuração padrão salva no banco de dados local.
+    """
+    with engine.connect() as conn:
+        result = conn.execute(
+            text("SELECT conta_financeira_id, categoria_id FROM conta_azul_config LIMIT 1")
         ).first()
-        if row:
-            return {"conta_financeira": row.conta_financeira, "categoria": row.categoria}
+        
+        if result:
+            return {
+                "conta_financeira_id": result.conta_financeira_id,
+                "categoria_id": result.categoria_id
+            }
         return None
-    finally:
-        session.close()
 
-def definir_configuracao(conta_financeira: str, categoria: str):
-    """Salva os UUIDs de conta e categoria (upsert na linha id=1)."""
-    session = SessionLocal()
-    try:
-        session.execute(
+def definir_configuracao(conta_financeira_id: str, categoria_id: str):
+    """
+    Salva ou atualiza a conta bancária e categoria de receita padrão na tabela do banco de dados.
+    """
+    with engine.begin() as conn:
+        # Limpa registros antigos para manter apenas a configuração vigente
+        conn.execute(text("DELETE FROM conta_azul_config"))
+        
+        # Insere a nova configuração ativa
+        conn.execute(
             text("""
-                INSERT INTO conta_azul_config (id, conta_financeira, categoria)
-                VALUES (1, :conta, :cat)
-                ON CONFLICT (id) DO UPDATE SET conta_financeira = EXCLUDED.conta_financeira,
-                                              categoria = EXCLUDED.categoria,
-                                              atualizado_em = NOW()
+                INSERT INTO conta_azul_config (conta_financeira_id, categoria_id)
+                VALUES (:conta_id, :cat_id)
             """),
-            {"conta": conta_financeira, "cat": categoria}
+            {"conta_id": conta_financeira_id, "cat_id": categoria_id}
         )
-        session.commit()
-    finally:
-        session.close()
 
 def obter_ou_criar_contato(nome: str) -> str:
     """Retorna o UUID do contato (cliente) no Conta Azul.

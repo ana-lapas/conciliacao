@@ -1,4 +1,3 @@
-# app.py
 import logging
 import os
 import tempfile
@@ -10,23 +9,23 @@ from sqlalchemy import create_engine, text
 # --- IMPORTAÇÃO DOS SERVIÇOS DO BACKEND ---
 # Importamos as funções que conversam com as APIs externas (Conta Azul e Sofia) e tratam os arquivos
 from app.services.conta_azul import (
-    exchange_code,          # Troca o código temporário do OAuth2 pelo token de acesso
-    get_authorization_url,  # Gera o link para o usuário logar no Conta Azul
-    get_credentials,        # Busca os tokens salvos no banco de dados local
+    exchange_code,           # Troca o código temporário do OAuth2 pelo token de acesso
+    get_authorization_url,   # Gera o link para o usuário logar no Conta Azul
+    get_credentials,         # Busca os tokens salvos no banco de dados local
 )
 from app.services.conta_azul_utils import (
-    definir_configuracao,       # Salva a conta bancária e categoria padrão selecionadas
-    listar_categorias_receita,  # Busca categorias financeiras da API do Conta Azul
-    listar_contas_financeiras,  # Busca contas bancárias da API do Conta Azul
+    definir_configuracao,        # Salva a conta bancária e categoria padrão selecionadas
+    listar_categorias_receita,   # Busca categorias financeiras da API do Conta Azul
+    listar_contas_financeiras,   # Busca contas bancárias da API do Conta Azul
     obter_configuracao,
     obter_ou_criar_categoria,
     obter_ou_criar_contato,
     traduzir_erro_para_usuario,
 )
-from app.services.matcher import conciliar_retorno   # Motor que cruza pagamentos com a API da Sofia
-from app.services.remessa_sync import sincronizar_remessa  # Lógica que lê o arquivo .rem e salva no banco
-from app.services.retorno_sync import sincronizar_retorno  # Lógica que lê o arquivo .ret e salva no banco
-from app.services.sofia_api import SofiaAPI                # Cliente HTTP para a API escolar Sofia
+from app.services.matcher import conciliar_retorno    # Motor que cruza pagamentos com a API da Sofia
+from app.services.remessa_sync import sincronizar_remessa   # Lógica que lê o arquivo .rem e salva no banco
+from app.services.retorno_sync import sincronizar_retorno   # Lógica que lê o arquivo .ret e salva no banco
+from app.services.sofia_api import SofiaAPI                 # Cliente HTTP para a API escolar Sofia
 
 # -----------------------------------------------------------------------------
 # 1. CONFIGURAÇÕES INICIAIS E BANCO DE DADOS
@@ -48,6 +47,20 @@ st.title("🔄 Conciliação Financeira Escolar")
 # Cria o pool de conexões com o banco de dados PostgreSQL
 DATABASE_URL = os.getenv("DATABASE_URL")
 engine = create_engine(DATABASE_URL)
+
+# --- GARANTE A CRIAÇÃO DA TABELA DE CONFIGURAÇÕES DO CONTA AZUL (PONTO D) ---
+# Executa um DDL atômico para impedir erros caso o banco seja zerado ou reiniciado
+with engine.begin() as conn:
+    conn.execute(
+        text("""
+            CREATE TABLE IF NOT EXISTS conta_azul_config (
+                id SERIAL PRIMARY KEY,
+                conta_financeira_id VARCHAR(255) NOT NULL,
+                categoria_id VARCHAR(255) NOT NULL,
+                atualizado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+    )
 
 # -----------------------------------------------------------------------------
 # 2. DASHBOARDS E MÉTRICAS (Roda a cada refresh da página)
@@ -184,11 +197,12 @@ with tab1:
 with tab2:
     st.header("Pagamentos Pendentes de Revisão")
 
-    # Busca no banco apenas os pagamentos marcados como 'PENDENTE_REVISAO'
+    # Busca no banco os pagamentos pendentes, trazendo o responsável e o aluno
     with engine.connect() as conn:
         pendentes = conn.execute(
             text("""
-                SELECT pm.id, pm.retorno_id, r.nosso_numero, pm.nome_responsavel,
+                SELECT pm.id, pm.retorno_id, r.nosso_numero, 
+                       pm.nome_responsavel, COALESCE(pm.nome_aluno, 'N/A') AS nome_aluno,
                        r.valor_pago, r.data_pagamento, pm.mensagem
                 FROM payment_match pm
                 JOIN retorno r ON r.id = pm.retorno_id
@@ -204,7 +218,8 @@ with tab2:
                 "ID",
                 "Retorno ID",
                 "Nosso Número",
-                "Nome Atual",
+                "Responsável Atual",
+                "Aluno Atual",
                 "Valor Pago",
                 "Data Pagamento",
                 "Mensagem",
@@ -213,7 +228,7 @@ with tab2:
 
         st.write("👆 **Selecione uma linha na tabela abaixo para editar:**")
 
-        # Exibe a tabela e permite que o usuário clique em uma linha
+        # Exibe a tabela interativa
         evento = st.dataframe(
             df,
             width="stretch",
@@ -222,35 +237,38 @@ with tab2:
             on_select="rerun", # Recarrega o script assim que uma linha for clicada
         )
 
-        # Captura o índice da linha que o usuário clicou
         linhas_selecionadas = evento.selection.rows
 
-        # Se houver uma linha selecionada, desenha o formulário de edição abaixo da tabela
+        # Se houver uma linha selecionada, desenha os campos de edição
         if linhas_selecionadas:
             idx_linha = linhas_selecionadas[0]
             row = df.iloc[idx_linha]
             selected_id = int(row["ID"])
 
             st.subheader(f"Editando pagamento: {row['Nosso Número']}")
-            # Campo para o operador corrigir o nome do aluno/responsável se o matcher automático falhou
-            novo_nome = st.text_input(
-                "Nome real do pagador (conforme boleto/PDF):", value=row["Nome Atual"]
-            )
+            
+            # --- CAMPOS DE EDIÇÃO DUPLA: RESPONSÁVEL E ALUNO ---
+            col_a, col_b = st.columns(2)
+            with col_a:
+                novo_nome_resp = st.text_input(
+                    "Nome real do responsável (pagador):", value=row["Responsável Atual"]
+                )
+            with col_b:
+                novo_nome_aluno = st.text_input(
+                    "Nome real do aluno:", value=row["Aluno Atual"]
+                )
 
             # Botão de ação: Aprova e envia para o ERP
             if st.button("Aprovar e Enviar para Conta Azul", type="primary"):
-                # Abre transação no banco (engine.begin) para garantir atomicidade
+                # Abre transação no banco para garantir atomicidade
                 with engine.begin() as conn:
                     
                     # --- 1. TRAVA DE CONCORRÊNCIA (PESSIMISTIC LOCKING) ---
-                    # Bloqueia a linha no PostgreSQL (FOR UPDATE) para impedir que outro usuário
-                    # altere o mesmo registro no mesmo milissegundo.
                     status_atual = conn.execute(
                         text("SELECT status FROM payment_match WHERE id = :id FOR UPDATE"),
                         {"id": selected_id},
                     ).scalar()
 
-                    # Se outro usuário já tiver aprovado este item enquanto esta tela estava aberta, aborta.
                     if status_atual != "PENDENTE_REVISAO":
                         st.warning(
                             "⚠️ Este pagamento já foi processado ou alterado por outro usuário. Recarregando..."
@@ -258,22 +276,31 @@ with tab2:
                         st.rerun()
 
                     # --- 2. ATUALIZAÇÕES LOCAIS NO BANCO ---
-                    # Salva o nome corrigido e muda o status para CONCILIADO
+                    # Salva os nomes do responsável e do aluno corrigidos e muda o status para CONCILIADO
                     conn.execute(
-                        text(
-                            "UPDATE payment_match SET nome_responsavel = :nome, status = 'CONCILIADO' WHERE id = :id"
-                        ),
-                        {"nome": novo_nome.strip().upper(), "id": selected_id},
+                        text("""
+                            UPDATE payment_match 
+                            SET nome_responsavel = :resp, 
+                                nome_aluno = :aluno, 
+                                status = 'CONCILIADO' 
+                            WHERE id = :id
+                        """),
+                        {
+                            "resp": novo_nome_resp.strip().upper(),
+                            "aluno": novo_nome_aluno.strip().upper(),
+                            "id": selected_id,
+                        },
                     )
 
-                    # Copia valores consolidados da tabela de retorno e remessa para a tabela de conciliação
+                    # --- CORREÇÃO DO PONTO C: FALLBACK DA DATA DE VENCIMENTO ---
+                    # Se data_vencimento for nula na remessa, usa a data de pagamento do retorno
                     conn.execute(
                         text("""
                             UPDATE payment_match pm
                             SET
                                 valor_pago = r.valor_pago,
                                 data_pagamento = r.data_pagamento,
-                                data_vencimento = COALESCE(pm.data_vencimento, rem.data_vencimento)
+                                data_vencimento = COALESCE(pm.data_vencimento, rem.data_vencimento, r.data_pagamento)
                             FROM retorno r
                             LEFT JOIN remessa rem ON rem.nosso_numero = r.nosso_numero
                             WHERE pm.id = :pm_id AND r.id = :ret_id
@@ -281,9 +308,7 @@ with tab2:
                         {"pm_id": selected_id, "ret_id": int(row["Retorno ID"])},
                     )
 
-                    # =========================================================================
-                    # [CAPTURA EXPLÍCITA DA DESCRIÇÃO] Busca as mensagens da remessa no banco
-                    # =========================================================================
+                    # Busca as mensagens da remessa para compor a descrição
                     descricao = None
                     row_desc = conn.execute(
                         text(
@@ -293,71 +318,85 @@ with tab2:
                     ).first()
 
                     if row_desc:
-                        # Une as 4 mensagens em uma única string usando o separador ' | '
-                        partes = [
-                            row_desc.mensagem1,
-                            row_desc.mensagem2,
-                            row_desc.mensagem3,
-                            row_desc.mensagem4,
-                        ]
+                        partes = [row_desc.mensagem1, row_desc.mensagem2, row_desc.mensagem3, row_desc.mensagem4]
                         descricao = " | ".join(p for p in partes if p)
-                        
-                        # Salva a descrição consolidada na tabela payment_match
                         conn.execute(
-                            text(
-                                "UPDATE payment_match SET descricao_pagamento = :desc WHERE id = :id"
-                            ),
+                            text("UPDATE payment_match SET descricao_pagamento = :desc WHERE id = :id"),
                             {"desc": descricao, "id": selected_id},
                         )
 
                     # --- 3. ENVIO SÍNCRONO PARA O CONTA AZUL ---
                     try:
-                        from app.services.conta_azul_receitas import (
-                            criar_receita_com_baixa,
-                        )
+                        from app.services.conta_azul_receitas import criar_receita_com_baixa
 
-                        # Formata a descrição final com o nome do pagador corrigido
-                        descricao_completa = (
-                            f"{descricao or 'Boleto'} - Aluno: {novo_nome.strip().upper()}"
-                        )
+                        # Busca conta e categoria com fallback no banco local
+                        config = obter_configuracao() or {}
+                        conta_id = os.getenv("CONTA_AZUL_CONTA_FINANCEIRA_PADRAO_ID") or config.get("conta_financeira_id")
+                        categoria_id = os.getenv("CONTA_AZUL_CATEGORIA_PADRAO_ID") or config.get("categoria_id")
+
+                        if not conta_id or not categoria_id:
+                            raise ValueError("Conta bancária ou Categoria padrão não configurada na Aba 4!")
+
+                        base_desc = descricao if (descricao and descricao.strip()) else "Mensalidade Escolar"
+                        nome_resp_fmt = novo_nome_resp.strip().upper()
+                        nome_aluno_fmt = novo_nome_aluno.strip().upper()
+
+                        # Formata a data de pagamento
                         data_pagamento_str = (
                             row["Data Pagamento"].strftime("%Y-%m-%d")
                             if hasattr(row["Data Pagamento"], "strftime")
                             else str(row["Data Pagamento"])
                         )
 
-                        # Envia a requisição HTTP POST para criar a receita no ERP Conta Azul
+                        # Busca a data_vencimento atualizada do banco
+                        data_vencimento_str = conn.execute(
+                            text("SELECT data_vencimento FROM payment_match WHERE id = :id"),
+                            {"id": selected_id},
+                        ).scalar()
+                        data_vencimento_str = str(data_vencimento_str) if data_vencimento_str else data_pagamento_str
+
+                        # Formatação visual amigável para a discriminação do ERP (Ex: R$ 850,00 e DD/MM/AAAA)
+                        valor_fmt = f"R$ {float(row['Valor Pago']):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+                        try:
+                            venc_dt = pd.to_datetime(data_vencimento_str)
+                            venc_fmt = venc_dt.strftime("%d/%m/%Y")
+                        except Exception:
+                            venc_fmt = str(data_vencimento_str)
+
+                        # --- MONTAGEM DA DISCRIMINAÇÃO COMPLETA SOLICITADA ---
+                        descricao_completa = (
+                            f"{base_desc} | Resp: {nome_resp_fmt} | Aluno: {nome_aluno_fmt} | "
+                            f"Valor: {valor_fmt} | Venc: {venc_fmt}"
+                        )
+
+                        # Envia para a API do Conta Azul passando todos os campos necessários
                         parcela_id = criar_receita_com_baixa(
-                            data_vencimento=data_pagamento_str,
+                            data_vencimento=data_vencimento_str,
                             valor=float(row["Valor Pago"]),
                             descricao=descricao_completa,
-                            nome_cliente=novo_nome.strip().upper(),
+                            nome_cliente=nome_resp_fmt,
                             data_pagamento=data_pagamento_str,
+                            conta_id=conta_id,
+                            categoria_id=categoria_id,
                         )
-                        
-                        # Salva o ID retornado pela API do Conta Azul para confirmar a integração
+
+                        # Grava o ID da receita retornado pelo Conta Azul
                         conn.execute(
-                            text(
-                                "UPDATE payment_match SET conta_azul_receita_id = :caid WHERE id = :id"
-                            ),
+                            text("UPDATE payment_match SET conta_azul_receita_id = :caid WHERE id = :id"),
                             {"caid": parcela_id, "id": selected_id},
                         )
-                        # Notificação persistente que permanece visível mesmo após o st.rerun()
                         st.toast("✅ Pagamento aprovado e receita criada no Conta Azul!", icon="🎉")
-                    
+
                     except Exception as e:
-                        # Extrai a primeira linha limpa do erro para não estourar limite no banco
+                        # Extrai a primeira linha limpa do erro para gravar no log de mensagens do banco
                         msg_erro = str(e).split('\n')[0]
                         conn.execute(
                             text("UPDATE payment_match SET mensagem = :msg WHERE id = :id"),
-                            {
-                                "msg": f"Erro Conta Azul: {msg_erro}",
-                                "id": selected_id,
-                            },
+                            {"msg": f"Erro Conta Azul: {msg_erro}", "id": selected_id},
                         )
                         st.toast(f"⚠️ Pagamento aprovado, mas falhou no Conta Azul: {msg_erro}", icon="🚨")
 
-                # Força o Streamlit a recarregar a tela para sumir com a linha processada
+                # Recarrega a tela para atualizar a lista
                 st.rerun()
     else:
         st.info("Nenhum pagamento pendente de revisão.")
@@ -369,14 +408,15 @@ with tab3:
     st.header("Pagamentos Conciliados (Prontos para Exportação)")
 
     with engine.connect() as conn:
-        # Usa LEFT JOIN para não perder registros sem arquivo de retorno associado
+        # Busca pagamentos conciliados com suporte a fallback de vencimento
         conciliados = conn.execute(
             text("""
                 SELECT pm.id, pm.retorno_id, COALESCE(r.nosso_numero, 'N/A') AS nosso_numero, 
-                       pm.nome_responsavel, pm.cpf_responsavel,
+                       pm.nome_responsavel, pm.nome_aluno, pm.cpf_responsavel,
                        COALESCE(pm.valor_pago, r.valor_pago, 0) AS valor_pago,
                        COALESCE(pm.data_pagamento, r.data_pagamento) AS data_pagamento,
-                       pm.data_vencimento, pm.mensagem, pm.conta_azul_receita_id
+                       COALESCE(pm.data_vencimento, r.data_pagamento) AS data_vencimento, 
+                       pm.mensagem, pm.conta_azul_receita_id
                 FROM payment_match pm
                 LEFT JOIN retorno r ON r.id = pm.retorno_id
                 WHERE pm.status = 'CONCILIADO'
@@ -391,6 +431,7 @@ with tab3:
                 "Retorno ID",
                 "Nosso Número",
                 "Nome Responsável",
+                "Nome Aluno",
                 "CPF",
                 "Valor Pago",
                 "Data Pagamento",
@@ -399,14 +440,12 @@ with tab3:
                 "Enviado ao Conta Azul?",
             ],
         )
-        # Formata a coluna de ID do Conta Azul para uma resposta visual simples (Sim/Não)
         df_conciliados["Enviado ao Conta Azul?"] = df_conciliados[
             "Enviado ao Conta Azul?"
         ].apply(lambda x: "Sim" if x else "Não")
 
         st.write("👆 **Selecione uma linha para reabrir o registro:**")
 
-        # Tabela interativa para seleção de conciliações prontas
         evento_tab3 = st.dataframe(
             df_conciliados,
             width="stretch",
@@ -428,10 +467,9 @@ with tab3:
 
                 st.info(f"Registro selecionado: **{row_selecionada['Nosso Número']}**")
 
-                # Botão para estornar a conciliação e mandá-la de volta para a Aba 2 (Revisão)
+                # Botão para estornar a conciliação
                 if st.button("Reabrir Registro Selecionado", type="primary"):
                     with engine.begin() as conn:
-                        # TRAVA DE CONCORRÊNCIA: Verifica se o item ainda está com status CONCILIADO
                         status_atual = conn.execute(
                             text("SELECT status FROM payment_match WHERE id = :id FOR UPDATE"),
                             {"id": selected_id_tab3},
@@ -443,21 +481,14 @@ with tab3:
                             )
                             st.rerun()
 
-                        # Volta o status para PENDENTE_REVISAO nas tabelas correspondentes
                         conn.execute(
-                            text(
-                                "UPDATE payment_match SET status = 'PENDENTE_REVISAO' WHERE id = :id"
-                            ),
+                            text("UPDATE payment_match SET status = 'PENDENTE_REVISAO' WHERE id = :id"),
                             {"id": selected_id_tab3},
                         )
 
-                        if row_selecionada["Retorno ID"] and pd.notna(
-                            row_selecionada["Retorno ID"]
-                        ):
+                        if row_selecionada["Retorno ID"] and pd.notna(row_selecionada["Retorno ID"]):
                             conn.execute(
-                                text(
-                                    "UPDATE retorno SET status = 'PENDENTE_REVISAO' WHERE id = :rid"
-                                ),
+                                text("UPDATE retorno SET status = 'PENDENTE_REVISAO' WHERE id = :rid"),
                                 {"rid": int(row_selecionada["Retorno ID"])},
                             )
 
@@ -467,7 +498,6 @@ with tab3:
                 st.write("*Selecione um registro na tabela para reabrir.*")
 
         with col2:
-            # Exportação de relatório em CSV
             if st.button("Exportar CSV (todos os conciliados)"):
                 csv = df_conciliados.to_csv(index=False, sep=";")
                 st.download_button(
@@ -477,71 +507,85 @@ with tab3:
                     mime="text/csv",
                 )
 
-        # Seção para reprocessar erros de envio para o Conta Azul
+        # Reprocessamento de erros de envio
         st.subheader("Envio ao Conta Azul")
         nao_enviados = df_conciliados[df_conciliados["Enviado ao Conta Azul?"] == "Não"]
 
         if not nao_enviados.empty:
-            st.info(
-                f"Existem {len(nao_enviados)} registro(s) ainda não enviados ao Conta Azul."
-            )
+            st.info(f"Existem {len(nao_enviados)} registro(s) ainda não enviados ao Conta Azul.")
             if st.button("Reenviar todos os não enviados"):
                 progresso = st.progress(0)
                 sucessos = 0
                 falhas = 0
                 total = len(nao_enviados)
 
-                # Itera item por item enviando para a API e atualizando a barra de progresso
                 for i, (idx, row) in enumerate(nao_enviados.iterrows()):
                     try:
-                        # Busca a descrição gravada previamente no banco
                         with engine.connect() as conn2:
-                            desc_row = conn2.execute(
+                            dados_pm = conn2.execute(
                                 text(
-                                    "SELECT descricao_pagamento FROM payment_match WHERE id = :id"
+                                    "SELECT descricao_pagamento, nome_aluno, nome_responsavel, data_vencimento FROM payment_match WHERE id = :id"
                                 ),
                                 {"id": row["ID"]},
                             ).first()
-                            descricao_atual = desc_row[0] if desc_row else None
 
-                        from app.services.conta_azul_receitas import (
-                            criar_receita_com_baixa,
+                        descricao_atual = dados_pm.descricao_pagamento if dados_pm else None
+                        nome_aluno = dados_pm.nome_aluno if (dados_pm and dados_pm.nome_aluno) else "N/A"
+                        nome_resp = row["Nome Responsável"]
+
+                        # Fallback seguro para data de vencimento
+                        vencimento = str(dados_pm.data_vencimento) if (dados_pm and dados_pm.data_vencimento) else str(row["Data Pagamento"])
+
+                        config = obter_configuracao() or {}
+                        conta_id = os.getenv("CONTA_AZUL_CONTA_FINANCEIRA_PADRAO_ID") or config.get("conta_financeira_id")
+                        categoria_id = os.getenv("CONTA_AZUL_CATEGORIA_PADRAO_ID") or config.get("categoria_id")
+
+                        if not conta_id or not categoria_id:
+                            raise ValueError("Conta bancária ou Categoria padrão não configurada na Aba 4!")
+
+                        base_desc = descricao_atual if (descricao_atual and descricao_atual.strip()) else "Mensalidade Escolar"
+                        
+                        # Formatações amigáveis
+                        valor_fmt = f"R$ {float(row['Valor Pago']):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+                        try:
+                            venc_dt = pd.to_datetime(vencimento)
+                            venc_fmt = venc_dt.strftime("%d/%m/%Y")
+                        except Exception:
+                            venc_fmt = str(vencimento)
+
+                        # Discrimination unificada
+                        descricao_completa = (
+                            f"{base_desc} | Resp: {nome_resp.strip().upper()} | Aluno: {nome_aluno.strip().upper()} | "
+                            f"Valor: {valor_fmt} | Venc: {venc_fmt}"
                         )
 
-                        descricao_completa = f"{descricao_atual or 'Boleto'} - Aluno: {row['Nome Responsável']}"
+                        from app.services.conta_azul_receitas import criar_receita_com_baixa
 
                         parcela_id = criar_receita_com_baixa(
-                            data_vencimento=str(row["Data Pagamento"]),
+                            data_vencimento=vencimento,
                             valor=float(row["Valor Pago"]),
                             descricao=descricao_completa,
-                            nome_cliente=row["Nome Responsável"],
+                            nome_cliente=nome_resp,
                             data_pagamento=str(row["Data Pagamento"]),
+                            conta_id=conta_id,
+                            categoria_id=categoria_id,
                         )
 
                         with engine.begin() as conn3:
                             conn3.execute(
-                                text(
-                                    "UPDATE payment_match SET conta_azul_receita_id = :caid WHERE id = :id"
-                                ),
+                                text("UPDATE payment_match SET conta_azul_receita_id = :caid WHERE id = :id"),
                                 {"caid": parcela_id, "id": row["ID"]},
                             )
                         sucessos += 1
 
                     except Exception as e:
                         falhas += 1
-                        # Extrai a primeira linha limpa do erro
                         msg_erro = str(e).split('\n')[0]
                         with engine.begin() as conn3:
                             conn3.execute(
-                                text(
-                                    "UPDATE payment_match SET mensagem = :msg WHERE id = :id"
-                                ),
-                                {
-                                    "msg": f"Erro no reenvio: {msg_erro}",
-                                    "id": row["ID"],
-                                },
+                                text("UPDATE payment_match SET mensagem = :msg WHERE id = :id"),
+                                {"msg": f"Erro no reenvio: {msg_erro}", "id": row["ID"]},
                             )
-                    # Atualiza a barra de progresso visual
                     progresso.progress((i + 1) / total)
 
                 if falhas > 0:
@@ -561,27 +605,21 @@ with tab3:
 with tab4:
     st.header("Conexão Conta Azul")
 
-    # Lê os parâmetros 'code' e 'state' retornados na URL após o login no Conta Azul
     params = st.query_params
     code = params.get("code", None)
     state = params.get("state", None)
 
-    # Se a URL contém o código de autorização, executa a troca pelo Access Token
+    # Processa retorno do callback OAuth2
     if code:
         with st.spinner("Autorizando..."):
             try:
                 expected_state = st.session_state.get("oauth_state")
                 if expected_state and state != expected_state:
-                    st.warning(
-                        "Aviso de segurança: state não corresponde. Continuando mesmo assim."
-                    )
+                    st.warning("Aviso de segurança: state não corresponde. Continuando mesmo assim.")
                 exchange_code(code, state)
                 st.success("Autorizado com sucesso!")
                 
-                # Limpa os parâmetros da URL para evitar reutilizar o 'code' expirado
-                new_params = {
-                    k: v for k, v in st.query_params.items() if k not in ("code", "state")
-                }
+                new_params = {k: v for k, v in st.query_params.items() if k not in ("code", "state")}
                 st.query_params.clear()
                 st.query_params.update(new_params)
                 st.rerun()
@@ -589,40 +627,33 @@ with tab4:
                 st.error(f"Erro na autorização: {e}")
                 st.exception(e)
 
-    # Verifica se já temos um Access Token válido salvo na tabela local
+    # Exibe estado da credencial
     creds = get_credentials()
     if creds and creds.get("access_token"):
-        st.success(
-            f"Conectado! Token válido até {creds['expires_at'].strftime('%d/%m/%Y %H:%M')}"
-        )
+        st.success(f"Conectado! Token válido até {creds['expires_at'].strftime('%d/%m/%Y %H:%M')}")
     else:
-        # Se não estiver conectado, gera o link de autorização OAuth2
         auth_url, state = get_authorization_url()
         st.session_state["oauth_state"] = state
         st.link_button("Conectar com Conta Azul", url=auth_url)
 
     st.subheader("Configurar contas e categorias")
 
-    # Botão para consultar a API do Conta Azul e listar as contas/categorias do usuário
+    # Botão para listar opções da API
     if st.button("Carregar contas financeiras e categorias"):
         st.session_state.contas = listar_contas_financeiras()
         st.session_state.categorias = listar_categorias_receita()
 
-    # Exibe os seletores e salva os mapeamentos padrão no banco
+    # Dropdowns de seleção e salvamento no banco local
     if "contas" in st.session_state and "categorias" in st.session_state:
         opcoes_conta = {c["nome"]: c["id"] for c in st.session_state.contas}
         opcoes_cat = {c["nome"]: c["id"] for c in st.session_state.categorias}
 
-        conta_selecionada = st.selectbox(
-            "Selecione a Conta Bancária:", list(opcoes_conta.keys())
-        )
-        cat_selecionada = st.selectbox(
-            "Selecione a Categoria de Receita:", list(opcoes_cat.keys())
-        )
+        conta_selecionada = st.selectbox("Selecione a Conta Bancária:", list(opcoes_conta.keys()))
+        cat_selecionada = st.selectbox("Selecione a Categoria de Receita:", list(opcoes_cat.keys()))
 
-        if st.button("Salvar configuração"):
-            # Mapeia os UUIDs selecionados para uso nos payloads das receitas
-            definir_configuracao(
-                opcoes_conta[conta_selecionada], opcoes_cat[cat_selecionada]
-            )
-            st.success("Configuração salva com sucesso!")
+        if st.button("Salvar configuração", type="primary"):
+            id_conta = opcoes_conta[conta_selecionada]
+            id_cat = opcoes_cat[cat_selecionada]
+            
+            definir_configuracao(id_conta, id_cat)
+            st.toast("✅ Configuração padrão do Conta Azul salva no banco com sucesso!", icon="💾")
