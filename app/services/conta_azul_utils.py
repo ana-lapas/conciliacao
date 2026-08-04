@@ -43,16 +43,16 @@ def definir_configuracao(conta_financeira_id: str, categoria_id: str):
             {"conta_id": conta_financeira_id, "cat_id": categoria_id}
         )
 
-def obter_ou_criar_contato(nome: str) -> str:
+def obter_ou_criar_contato(nome: str, cpf: str = None) -> str:
     """Retorna o UUID do contato (cliente) no Conta Azul.
-    
-    Se não existir no banco local, busca na API do Conta Azul e cria se necessário.
-    Garante resiliência criando a tabela 'conta_azul_contato' caso não exista.
+
+    Se não existir no banco local, busca na API. Se não encontrar,
+    cria a pessoa respeitando a documentação da API v2 do Conta Azul.
     """
     nome = nome.strip().upper()
     session = SessionLocal()
     try:
-        # Garante a existência da tabela de mapeamento local no PostgreSQL
+        # 1. Garante resiliência criando a tabela se não existir
         session.execute(
             text("""
                 CREATE TABLE IF NOT EXISTS public.conta_azul_contato (
@@ -65,17 +65,22 @@ def obter_ou_criar_contato(nome: str) -> str:
         )
         session.commit()
 
-        # 1. Tenta buscar no banco de dados local (Cache)
+        # 2. Busca no banco de dados local (Cache)
         row = session.execute(
             text("SELECT contato_uuid FROM conta_azul_contato WHERE nome = :nome"),
             {"nome": nome}
         ).first()
-        
+
         if row:
             return row.contato_uuid
 
-        # 2. Busca na API do Conta Azul se não encontrar localmente
+        # 3. Busca na API do Conta Azul pelo nome
         token = _get_valid_access_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
+
         resp = requests.get(
             "https://api-v2.contaazul.com/v1/pessoas",
             headers={"Authorization": f"Bearer {token}"},
@@ -83,24 +88,39 @@ def obter_ou_criar_contato(nome: str) -> str:
         )
         resp.raise_for_status()
         pessoas = resp.json()
-        
+
         if pessoas:
             uuid = pessoas[0]["id"]
         else:
-            # 3. Se não existir no Conta Azul, cria o novo cadastro (Pessoa Física)
-            payload = {"nome": nome, "tipo": "FISICA"}
-            resp = requests.post(
+            # 4. Criar novo contato montando apenas os campos existentes
+            payload = {
+                "nome": nome,
+                "tipo_pessoa": "Física",
+                "perfis": [
+                    {
+                        "tipo_perfil": "Cliente"
+                    }
+                ]
+            }
+
+            # Envia o CPF apenas se estiver presente e preenchido
+            if cpf and cpf.strip():
+                payload["cpf"] = cpf.strip()
+
+            resp_post = requests.post(
                 "https://api-v2.contaazul.com/v1/pessoas",
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/json"
-                },
+                headers=headers,
                 json=payload
             )
-            resp.raise_for_status()
-            uuid = resp.json()["id"]
 
-        # 4. Salva o mapeamento no banco local para chamadas futuras
+            # Tratamento detalhado de erro para evitar logs sem contexto
+            if not resp_post.ok:
+                logger.error(f"Erro no POST /v1/pessoas ({resp_post.status_code}): {resp_post.text}")
+                resp_post.raise_for_status()
+
+            uuid = resp_post.json()["id"]
+
+        # 5. Salva no banco local
         session.execute(
             text("""
                 INSERT INTO conta_azul_contato (nome, contato_uuid)
@@ -111,14 +131,14 @@ def obter_ou_criar_contato(nome: str) -> str:
         )
         session.commit()
         return uuid
-        
+
     except Exception as e:
         session.rollback()
         logger.error(f"Erro ao obter/criar contato no Conta Azul: {e}")
         raise e
     finally:
         session.close()
-        
+          
 def obter_ou_criar_categoria(nome: str = "Recebimentos") -> str:
     token = _get_valid_access_token()
     # Buscar categoria pelo nome e tipo RECEITA
