@@ -1,11 +1,10 @@
 # services/conta_azul_utils.py
 import logging
 import requests
-from sqlalchemy import text
 from .conta_azul import _get_valid_access_token
 from app.services.cache_sync import SessionLocal
 import os
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 engine = create_engine(DATABASE_URL)
@@ -32,14 +31,26 @@ def definir_configuracao(conta_financeira_id: str, categoria_id: str):
     Salva ou atualiza a conta bancária e categoria de receita padrão na tabela do banco de dados.
     """
     with engine.begin() as conn:
+        # Garante a existência da tabela caso não tenha sido criada
+        conn.execute(
+            text("""
+                CREATE TABLE IF NOT EXISTS conta_azul_config (
+                    id SERIAL PRIMARY KEY,
+                    conta_financeira_id VARCHAR(255) NOT NULL,
+                    categoria_id VARCHAR(255) NOT NULL,
+                    atualizado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+        )
+
         # Limpa registros antigos para manter apenas a configuração vigente
-        conn.execute(text("DELETE FROM conta_azul_config"))
+        conn.execute(text("DELETE FROM conta_azul_config;"))
         
         # Insere a nova configuração ativa
         conn.execute(
             text("""
                 INSERT INTO conta_azul_config (conta_financeira_id, categoria_id)
-                VALUES (:conta_id, :cat_id)
+                VALUES (:conta_id, :cat_id);
             """),
             {"conta_id": conta_financeira_id, "cat_id": categoria_id}
         )
