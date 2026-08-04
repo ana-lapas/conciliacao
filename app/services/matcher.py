@@ -8,6 +8,7 @@ import re
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 
+from requests import session
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -213,7 +214,8 @@ def registrar_conciliacao(session: Session, ret, rem, resp: dict, lanc: dict) ->
         "vprev": float(lanc.get("valorPrevisto", ret.valor_pago)),
         "dpgto": ret.data_pagamento,
         "dvenc": lanc.get("dataVencimento", ret.data_pagamento),
-        "rid": ret.id
+        "rid": ret.id,
+        "dac": getattr(ret, 'dac', None) or (rem.dac if rem else None)
     }
 
     if existente:
@@ -224,7 +226,8 @@ def registrar_conciliacao(session: Session, ret, rem, resp: dict, lanc: dict) ->
                     remessa_id = :remid, student_id = :sid, student_responsible_id = :srid,
                     nome_responsavel = :nome_resp, cpf_responsavel = :cpf_resp,
                     lancamento_codigo = :lcod, valor_pago = :vpago, valor_previsto = :vprev,
-                    data_pagamento = :dpgto, data_vencimento = :dvenc, status = 'CONCILIADO', mensagem = NULL
+                    data_pagamento = :dpgto, data_vencimento = :dvenc, dac = :dac, 
+                    status = 'CONCILIADO', mensagem = NULL
                 WHERE id = :id
             """), params_match
         )
@@ -234,17 +237,18 @@ def registrar_conciliacao(session: Session, ret, rem, resp: dict, lanc: dict) ->
                 INSERT INTO payment_match (
                     retorno_id, remessa_id, student_id, student_responsible_id,
                     nome_responsavel, cpf_responsavel, lancamento_codigo, valor_pago,
-                    valor_previsto, data_pagamento, data_vencimento, status
+                    valor_previsto, data_pagamento, data_vencimento, dac, status
                 ) VALUES (
                     :rid, :remid, :sid, :srid, :nome_resp, :cpf_resp,
-                    :lcod, :vpago, :vprev, :dpgto, :dvenc, 'CONCILIADO'
+                    :lcod, :vpago, :vprev, :dpgto, :dvenc, :dac, 'CONCILIADO'
                 )
             """), params_match
         )
 
     session.execute(text("UPDATE retorno SET status = 'CONCILIADO' WHERE id = :rid"), {"rid": ret.id})
     if rem:
-        session.execute(text("UPDATE remessa SET status = 'PAGO' WHERE id = :remid"), {"remid": rem.id})
+        # Dentro do loop de retornos em conciliar_retorno:
+        rem = obter_remessa_por_nosso_numero(session, ret.nosso_numero, dac=getattr(ret, 'dac', None))
 
     # Integração Conta Azul com Tratamento Defensivo de Erros
     descricao_remessa = obter_descricao_pagamento(session, ret.nosso_numero)
