@@ -81,19 +81,31 @@ def buscar_responsaveis(session: Session, nome: Optional[str] = None, cpf: Optio
     return []
 
 
-def obter_remessa_por_nosso_numero(session: Session, nosso_numero: str):
+def obter_remessa_por_nosso_numero(session: Session, nosso_numero: str, dac: Optional[str] = None):
     """
-    Busca a Remessa original pelo Nosso Número normalizado.
+    Busca a Remessa original pelo Nosso Número normalizado e opcionalmente pelo DAC.
     """
     nn_limpo = normalizar_nosso_numero(nosso_numero)
-    query = text("""
+    
+    if dac:
+        query = text("""
+            SELECT * FROM remessa 
+            WHERE (LTRIM(nosso_numero, '0') = :nn_limpo OR nosso_numero = :nn_raw)
+              AND (dac = :dac OR dac IS NULL)
+            LIMIT 1
+        """)
+        res = session.execute(query, {"nn_limpo": nn_limpo, "nn_raw": nosso_numero, "dac": dac}).first()
+        if res:
+            return res
+
+    # Fallback buscando apenas pelo nosso número caso o DAC venha vazio
+    query_fallback = text("""
         SELECT * FROM remessa 
         WHERE LTRIM(nosso_numero, '0') = :nn_limpo 
            OR nosso_numero = :nn_raw
         LIMIT 1
     """)
-    return session.execute(query, {"nn_limpo": nn_limpo, "nn_raw": nosso_numero}).first()
-
+    return session.execute(query_fallback, {"nn_limpo": nn_limpo, "nn_raw": nosso_numero}).first()
 
 def obter_descricao_pagamento(session: Session, nosso_numero: str) -> Optional[str]:
     """
