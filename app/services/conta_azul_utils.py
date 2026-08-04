@@ -6,6 +6,7 @@ from app.services.cache_sync import SessionLocal
 import os
 from sqlalchemy import create_engine, text
 
+logger = logging.getLogger(__name__)
 DATABASE_URL = os.getenv("DATABASE_URL")
 engine = create_engine(DATABASE_URL)
 logger = logging.getLogger(__name__)
@@ -43,19 +44,14 @@ def definir_configuracao(conta_financeira_id: str, categoria_id: str):
             {"conta_id": conta_financeira_id, "cat_id": categoria_id}
         )
 
-import logging
-import requests
-from sqlalchemy import text
-from .conta_azul import _get_valid_access_token
-
-logger = logging.getLogger(__name__)
 
 def obter_ou_criar_contato(nome: str, cpf: str = None) -> str:
     """Retorna o UUID do contato (cliente) no Conta Azul."""
-    nome = nome.strip().upper()
+    nome_limpo = nome.strip().upper()
     session = SessionLocal()
+    
     try:
-        # 1. Garante a criação da tabela local
+        # 1. Tabela local de de-para
         session.execute(
             text("""
                 CREATE TABLE IF NOT EXISTS public.conta_azul_contato (
@@ -68,36 +64,44 @@ def obter_ou_criar_contato(nome: str, cpf: str = None) -> str:
         )
         session.commit()
 
-        # 2. Busca no banco de dados local
+        # 2. Consulta banco local
         row = session.execute(
             text("SELECT contato_uuid FROM conta_azul_contato WHERE nome = :nome"),
-            {"nome": nome}
+            {"nome": nome_limpo}
         ).first()
 
         if row:
             return row.contato_uuid
 
-        # 3. Busca na API do Conta Azul
         token = _get_valid_access_token()
         headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json"
         }
 
+        # 3. Consulta na API GET /v1/pessoas usando a chave "busca" (conforme documentação)
         resp = requests.get(
             "https://api-v2.contaazul.com/v1/pessoas",
             headers={"Authorization": f"Bearer {token}"},
-            params={"nome": nome}
+            params={
+                "busca": nome_limpo,
+                "tipo_perfil": "Cliente",
+                "tamanho_pagina": 10
+            }
         )
         resp.raise_for_status()
-        pessoas = resp.json()
+        
+        # CORREÇÃO AQUI: A API retorna um objeto {"items": [...]}
+        dados_busca = resp.json()
+        itens = dados_busca.get("items", []) if isinstance(dados_busca, dict) else []
 
-        if pessoas:
-            uuid = pessoas[0]["id"]
+        if itens:
+            # Encontrou o contato existente
+            uuid = itens[0]["id"]
         else:
-            # 4. Criar novo contato (apenas os campos estritamente necessários)
+            # 4. Criação do contato via POST /v1/pessoas
             payload = {
-                "nome": nome,
+                "nome": nome_limpo,
                 "tipo_pessoa": "Física",
                 "perfis": [
                     {
@@ -106,60 +110,57 @@ def obter_ou_criar_contato(nome: str, cpf: str = None) -> str:
                 ]
             }
 
-            if cpf and cpf.strip():
-                payload["cpf"] = cpf.strip()
+            # Trata CPF apenas se enviado e não vazio
+            if cpf and str(cpf).strip():
+                payload["cpf"] = str(cpf).strip()
 
             resp_post = requests.post(
                 "https://api-v2.contaazul.com/v1/pessoas",
                 headers=headers,
                 json=payload
             )
-            resp_post.raise_for_status()
+            
+            if not resp_post.ok:
+                logger.error(f"Erro POST /v1/pessoas ({resp_post.status_code}): {resp_post.text}")
+                resp_post.raise_for_status()
+                
             uuid = resp_post.json()["id"]
 
-        # 5. Salva o mapeamento no banco local
+        # 5. Salva o de-para localmente
         session.execute(
             text("""
                 INSERT INTO conta_azul_contato (nome, contato_uuid)
                 VALUES (:nome, :uuid)
                 ON CONFLICT (nome) DO NOTHING;
             """),
-            {"nome": nome, "uuid": uuid}
+            {"nome": nome_limpo, "uuid": uuid}
         )
         session.commit()
         return uuid
 
     except requests.exceptions.HTTPError as http_err:
-        session.rollback() # Limpa a transação que falhou
-        
+        session.rollback()
         status_code = http_err.response.status_code if http_err.response is not None else None
-        body_text = http_err.response.text if http_err.response is not None else "Sem resposta"
+        body_text = http_err.response.text if http_err.response is not None else str(http_err)
         
-        logger.error(f"Erro HTTP {status_code} na API Conta Azul ao criar/obter contato. Detalhes: {body_text}")
-        
-        # Persiste o erro de forma independente no banco
         registrar_log_erro(
             servico="obter_ou_criar_contato",
             status_code=status_code,
             resposta_erro=body_text,
             payload={"nome": nome, "cpf": cpf}
         )
-        
         raise http_err
 
     except Exception as e:
         session.rollback()
         erro_msg = f"{type(e).__name__}: {str(e)}"
-        logger.error(f"Erro inesperado ao obter/criar contato no Conta Azul: {erro_msg}")
         
-        # Persiste exceções genéricas
         registrar_log_erro(
             servico="obter_ou_criar_contato",
             status_code=None,
             resposta_erro=erro_msg,
             payload={"nome": nome, "cpf": cpf}
         )
-        
         raise e
     finally:
         session.close()
