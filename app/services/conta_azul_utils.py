@@ -123,3 +123,47 @@ def listar_contas_financeiras():
     resp.raise_for_status()
     contas = resp.json().get("itens", [])
     return [{"id": c["id"], "nome": c["nome"]} for c in contas]
+
+def traduzir_erro_para_usuario(exception: Exception) -> str:
+    """Converte uma exceção técnica em uma mensagem clara para a secretária."""
+    msg_original = str(exception)
+
+    mapeamento = [
+        ("403", "A conta do Conta Azul não está mais ativa. Entre em contato com o suporte do Conta Azul para reativar o plano."),
+        ("END_TRIAL", "O período de testes do Conta Azul expirou. Por favor, assine um plano para continuar usando a integração."),
+        ("401", "A conexão com o Conta Azul expirou. Clique em 'Conectar com Conta Azul' novamente para reautorizar."),
+        ("Token não encontrado", "Você ainda não conectou ao Conta Azul. Vá até a aba 'Conta Azul' e clique em 'Conectar'."),
+        ("date is not JSON serializable", "Erro interno: data inválida. Contate o suporte técnico."),
+        ("Max retries exceeded", "Não foi possível conectar ao servidor. Verifique sua internet e tente novamente."),
+        ("Failed to resolve", "Erro de rede. Verifique a conexão com a internet."),
+    ]
+
+    for chave, mensagem in mapeamento:
+        if chave.lower() in msg_original.lower():
+            return mensagem
+
+    # Se não mapeou, retorna uma mensagem genérica (nunca mostre o erro técnico)
+    return "Ocorreu um erro inesperado. Por favor, tente novamente ou contate o suporte."
+
+def listar_categorias_receita() -> list:
+    """Busca todas as categorias financeiras do tipo RECEITA na Conta Azul."""
+    token = _get_valid_access_token()
+    categorias = []
+    
+    # Lidando com a paginação (Fundamento de Escalabilidade)
+    url = "https://api-v2.contaazul.com/v1/categorias"
+    params = {"tipo": "RECEITA", "tamanho_pagina": 50, "pagina": 1}
+    
+    while True:
+        resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, params=params)
+        resp.raise_for_status()
+        
+        dados = resp.json()
+        itens = dados.get("itens", [])
+        if not itens:
+            break # Sai do loop quando não houver mais itens
+            
+        categorias.extend([{"id": c["id"], "nome": c["nome"]} for c in itens])
+        params["pagina"] += 1 # Vai para a próxima página
+        
+    return categorias

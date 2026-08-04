@@ -156,40 +156,40 @@ class SofiaAPI:
         return response
     
     def _request_with_retry(self, method: str, endpoint: str, params: dict = None,
-                        data: dict = None, max_retries: int = 3) -> requests.Response:
+                            data: dict = None, max_retries: int = 3) -> requests.Response:
         """
-        Executa _request com política de retentativas para erros transientes de rede.
-
-        Em caso de ConnectionError ou Timeout, repete a requisição até max_retries vezes,
-        com intervalo exponencial entre tentativas (2^tentativa + jitter aleatório).
-
-        Args:
-            method: Verbo HTTP ('GET', 'POST', etc.)
-            endpoint: Caminho relativo do recurso.
-            params: Parâmetros de consulta (query string).
-            data: Corpo JSON da requisição.
-            max_retries: Número máximo de tentativas (padrão 3).
-
-        Returns:
-            Resposta HTTP bem-sucedida.
-
-        Raises:
-            requests.exceptions.ConnectionError: se todas as tentativas falharem.
-            requests.exceptions.Timeout: se todas as tentativas expirarem.
+        Executa _request com política de retentativas Inteligente.
+        Faz retry apenas para falhas de rede, timeout e erros de servidor (5xx/429).
         """
         last_exception = None
         for attempt in range(1, max_retries + 1):
             try:
                 return self._request(method, endpoint, params, data)
-            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            
+            except requests.exceptions.HTTPError as e:
+                # 1. Capturamos o status code retornado pelo servidor
+                status = e.response.status_code if e.response is not None else None
+                
+                # 2. Regra de negócio: Só tentamos de novo se for limite de taxa (429) ou erro interno (5xx)
+                if status not in [429] and not (status and 500 <= status < 600):
+                    self.logger.error(f"Erro HTTP {status} (Sem Retry). Abortando: {e}")
+                    raise e # Aborta imediatamente, pois o erro está no payload ou autorização
+                
                 last_exception = e
-                wait = (2 ** attempt) + random.uniform(0, 1)
-                self.logger.warning(
-                    f"Tentativa {attempt}/{max_retries} falhou com {type(e).__name__}: {e}. "
-                    f"Tentando novamente em {wait:.1f}s..."
-                )
-                time.sleep(wait)
-        # Se esgotar as tentativas, levanta a última exceção
+                
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                # 3. Falhas puramente de infraestrutura/rede entram aqui
+                last_exception = e
+
+            # 4. Cálculo de Backoff Exponencial com Jitter (evita sobrecarga no servidor do Sophia)
+            wait = (2 ** attempt) + random.uniform(0, 1)
+            self.logger.warning(
+                f"Tentativa {attempt}/{max_retries} falhou ({type(last_exception).__name__}). "
+                f"Tentando novamente em {wait:.1f}s..."
+            )
+            time.sleep(wait)
+            
+        # 5. Se esgotar todas as tentativas, levanta a última exceção
         raise last_exception
 
     def _get_session(self):

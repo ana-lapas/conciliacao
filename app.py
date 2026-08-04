@@ -6,6 +6,7 @@ import tempfile
 from dotenv import load_dotenv, find_dotenv
 from sqlalchemy import create_engine, text
 from app.services.sofia_api import SofiaAPI
+from app.services.conta_azul_utils import listar_contas_financeiras, listar_categorias_receita, definir_configuracao
 from app.services.remessa_sync import sincronizar_remessa
 from app.services.retorno_sync import sincronizar_retorno
 from app.services.matcher import conciliar_retorno
@@ -26,6 +27,17 @@ st.title("🔄 Conciliação Financeira Escolar")
 DATABASE_URL = os.getenv("DATABASE_URL")
 engine = create_engine(DATABASE_URL)
 
+st.title("🔄 Conciliação Financeira Escolar")
+
+# --- NOVO: Dashboard Rápido ---
+with engine.connect() as conn:
+    qtd_pendentes = conn.execute(text("SELECT COUNT(*) FROM payment_match WHERE status = 'PENDENTE_REVISAO'")).scalar()
+    qtd_prontos = conn.execute(text("SELECT COUNT(*) FROM payment_match WHERE status = 'CONCILIADO' AND conta_azul_receita_id IS NULL")).scalar()
+
+col1, col2, col3 = st.columns(3)
+col1.metric("Pendentes de Revisão", qtd_pendentes, delta_color="inverse")
+col2.metric("Prontos p/ Envio Conta Azul", qtd_prontos)
+st.divider() 
 # -----------------------------------------------------------------------------
 # Abas
 # -----------------------------------------------------------------------------
@@ -357,23 +369,23 @@ with tab4:
         st.session_state["oauth_state"] = state
         st.link_button("Conectar com Conta Azul", url=auth_url)
 
-    # Na aba Conta Azul (tab4), adicione:
     st.subheader("Configurar contas e categorias")
-    conta_uuid = st.text_input("UUID da Conta Financeira (Conta Azul)")
-    cat_uuid = st.text_input("UUID da Categoria (Conta Azul)")
-    if st.button("Salvar configuração"):
-        from app.services.conta_azul_utils import definir_configuracao
-        definir_configuracao(conta_uuid, cat_uuid)
-        st.success("Configuração salva!")
+    
+    # 1. Carrega e exibe as contas financeiras (você já tinha isso)
+    if st.button("Carregar contas financeiras e categorias"):
+        st.session_state.contas = listar_contas_financeiras()
+        st.session_state.categorias = listar_categorias_receita() # Nova função do backend!
 
-    # dentro de tab4
-    if st.button("Carregar contas financeiras"):
-        contas = listar_contas_financeiras()
-        st.session_state.contas = contas
-
-    if "contas" in st.session_state:
-        opcoes = {c["nome"]: c["id"] for c in st.session_state.contas}
-        selecionada = st.selectbox("Selecione a conta financeira:", list(opcoes.keys()))
-        if st.button("Salvar conta selecionada"):
-            definir_configuracao(opcoes[selecionada])
-            st.success("Conta financeira configurada!")
+    if "contas" in st.session_state and "categorias" in st.session_state:
+        # Cria os dicionários para o selectbox
+        opcoes_conta = {c["nome"]: c["id"] for c in st.session_state.contas}
+        opcoes_cat = {c["nome"]: c["id"] for c in st.session_state.categorias}
+        
+        # O usuário seleciona visualmente pelo nome, mas o sistema guarda o UUID
+        conta_selecionada = st.selectbox("Selecione a Conta Bancária:", list(opcoes_conta.keys()))
+        cat_selecionada = st.selectbox("Selecione a Categoria de Receita:", list(opcoes_cat.keys()))
+        
+        if st.button("Salvar configuração"):
+            # Salva no banco de dados local os UUIDs exatos que a Conta Azul espera
+            definir_configuracao(opcoes_conta[conta_selecionada], opcoes_cat[cat_selecionada])
+            st.success("Configuração salva com sucesso!")
