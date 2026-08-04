@@ -11,11 +11,11 @@ from sqlalchemy import create_engine, text
 # Importamos as funções que conversam com as APIs externas (Conta Azul e Sofia) e tratam os arquivos
 from app.services.conta_azul import (
     exchange_code,          # Troca o código temporário do OAuth2 pelo token de acesso
-    get_authorization_url, # Gera o link para o usuário logar no Conta Azul
-    get_credentials,       # Busca os tokens salvos no banco de dados local
+    get_authorization_url,  # Gera o link para o usuário logar no Conta Azul
+    get_credentials,        # Busca os tokens salvos no banco de dados local
 )
 from app.services.conta_azul_utils import (
-    definir_configuracao,      # Salva a conta bancária e categoria padrão selecionadas
+    definir_configuracao,       # Salva a conta bancária e categoria padrão selecionadas
     listar_categorias_receita,  # Busca categorias financeiras da API do Conta Azul
     listar_contas_financeiras,  # Busca contas bancárias da API do Conta Azul
     obter_configuracao,
@@ -23,10 +23,10 @@ from app.services.conta_azul_utils import (
     obter_ou_criar_contato,
     traduzir_erro_para_usuario,
 )
-from app.services.matcher import conciliar_retorno  # Motor que cruza pagamentos com a API da Sofia
-from app.services.remessa_sync import sincronizar_remessa # Lógica que lê o arquivo .rem e salva no banco
-from app.services.retorno_sync import sincronizar_retorno # Lógica que lê o arquivo .ret e salva no banco
-from app.services.sofia_api import SofiaAPI               # Cliente HTTP para a API escolar Sofia
+from app.services.matcher import conciliar_retorno   # Motor que cruza pagamentos com a API da Sofia
+from app.services.remessa_sync import sincronizar_remessa  # Lógica que lê o arquivo .rem e salva no banco
+from app.services.retorno_sync import sincronizar_retorno  # Lógica que lê o arquivo .ret e salva no banco
+from app.services.sofia_api import SofiaAPI                # Cliente HTTP para a API escolar Sofia
 
 # -----------------------------------------------------------------------------
 # 1. CONFIGURAÇÕES INICIAIS E BANCO DE DADOS
@@ -281,7 +281,9 @@ with tab2:
                         {"pm_id": selected_id, "ret_id": int(row["Retorno ID"])},
                     )
 
-                    # Concatena as mensagens da remessa para formar o histórico financeiro
+                    # =========================================================================
+                    # [CAPTURA EXPLÍCITA DA DESCRIÇÃO] Busca as mensagens da remessa no banco
+                    # =========================================================================
                     descricao = None
                     row_desc = conn.execute(
                         text(
@@ -291,6 +293,7 @@ with tab2:
                     ).first()
 
                     if row_desc:
+                        # Une as 4 mensagens em uma única string usando o separador ' | '
                         partes = [
                             row_desc.mensagem1,
                             row_desc.mensagem2,
@@ -298,6 +301,8 @@ with tab2:
                             row_desc.mensagem4,
                         ]
                         descricao = " | ".join(p for p in partes if p)
+                        
+                        # Salva a descrição consolidada na tabela payment_match
                         conn.execute(
                             text(
                                 "UPDATE payment_match SET descricao_pagamento = :desc WHERE id = :id"
@@ -311,6 +316,7 @@ with tab2:
                             criar_receita_com_baixa,
                         )
 
+                        # Formata a descrição final com o nome do pagador corrigido
                         descricao_completa = (
                             f"{descricao or 'Boleto'} - Aluno: {novo_nome.strip().upper()}"
                         )
@@ -336,20 +342,20 @@ with tab2:
                             ),
                             {"caid": parcela_id, "id": selected_id},
                         )
-                        st.success("Pagamento aprovado e receita criada no Conta Azul!")
+                        # Notificação persistente que permanece visível mesmo após o st.rerun()
+                        st.toast("✅ Pagamento aprovado e receita criada no Conta Azul!", icon="🎉")
                     
                     except Exception as e:
-                        # Se der erro na API externa, registra a mensagem no banco sem desfazer a conciliação local
+                        # Extrai a primeira linha limpa do erro para não estourar limite no banco
+                        msg_erro = str(e).split('\n')[0]
                         conn.execute(
                             text("UPDATE payment_match SET mensagem = :msg WHERE id = :id"),
                             {
-                                "msg": f"Erro Conta Azul: {str(e)[:200]}",
+                                "msg": f"Erro Conta Azul: {msg_erro}",
                                 "id": selected_id,
                             },
                         )
-                        st.warning(
-                            f"Pagamento aprovado, mas houve falha ao enviar para o Conta Azul: {e}."
-                        )
+                        st.toast(f"⚠️ Pagamento aprovado, mas falhou no Conta Azul: {msg_erro}", icon="🚨")
 
                 # Força o Streamlit a recarregar a tela para sumir com a linha processada
                 st.rerun()
@@ -363,8 +369,7 @@ with tab3:
     st.header("Pagamentos Conciliados (Prontos para Exportação)")
 
     with engine.connect() as conn:
-        # Usa LEFT JOIN em vez de JOIN simples para garantir que registros
-        # sem arquivo de retorno associado não fiquem "fantasmas" sumidos da listagem
+        # Usa LEFT JOIN para não perder registros sem arquivo de retorno associado
         conciliados = conn.execute(
             text("""
                 SELECT pm.id, pm.retorno_id, COALESCE(r.nosso_numero, 'N/A') AS nosso_numero, 
@@ -489,6 +494,7 @@ with tab3:
                 # Itera item por item enviando para a API e atualizando a barra de progresso
                 for i, (idx, row) in enumerate(nao_enviados.iterrows()):
                     try:
+                        # Busca a descrição gravada previamente no banco
                         with engine.connect() as conn2:
                             desc_row = conn2.execute(
                                 text(
@@ -523,20 +529,26 @@ with tab3:
 
                     except Exception as e:
                         falhas += 1
+                        # Extrai a primeira linha limpa do erro
+                        msg_erro = str(e).split('\n')[0]
                         with engine.begin() as conn3:
                             conn3.execute(
                                 text(
                                     "UPDATE payment_match SET mensagem = :msg WHERE id = :id"
                                 ),
                                 {
-                                    "msg": f"Erro no reenvio: {str(e)[:200]}",
+                                    "msg": f"Erro no reenvio: {msg_erro}",
                                     "id": row["ID"],
                                 },
                             )
                     # Atualiza a barra de progresso visual
                     progresso.progress((i + 1) / total)
 
-                st.success(f"Reenvio concluído: {sucessos} sucessos, {falhas} falhas.")
+                if falhas > 0:
+                    st.toast(f"⚠️ Reenvio concluído: {sucessos} sucessos e {falhas} falha(s).", icon="🚨")
+                else:
+                    st.toast(f"✅ Todos os {sucessos} registros foram enviados com sucesso!", icon="🎉")
+                
                 st.rerun()
         else:
             st.success("Todos os registros conciliados já foram enviados ao Conta Azul.")
