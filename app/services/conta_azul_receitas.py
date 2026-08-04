@@ -102,8 +102,14 @@ def criar_receita_com_baixa(
         },
         json=payload_evento,
     )
-    resp.raise_for_status()
+    resp.raise_for_status()   
 
+    # Captura os detalhes do erro 400 retornados pelo Conta Azul
+    if not resp.ok:
+        logger.error(
+            f"Erro {resp.status_code} no POST contas-a-receber: {resp.text}"
+        )
+        resp.raise_for_status()
     # A API responde com um número de protocolo (processamento assíncrono no Conta Azul)
     protocolo = resp.json()
     logger.info(
