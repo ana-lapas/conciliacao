@@ -5,14 +5,19 @@ import os
 import tempfile
 from dotenv import load_dotenv, find_dotenv
 from sqlalchemy import create_engine, text
-
 from app.services.sofia_api import SofiaAPI
 from app.services.remessa_sync import sincronizar_remessa
 from app.services.retorno_sync import sincronizar_retorno
 from app.services.matcher import conciliar_retorno
 from app.services.conta_azul import get_authorization_url, exchange_code, get_credentials
+import logging
 
 load_dotenv(find_dotenv())
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    force=True   # <- força a reconfiguração, mesmo que outro módulo já tenha configurado
+)
 
 st.set_page_config(page_title="Conciliação Financeira", layout="wide")
 st.title("🔄 Conciliação Financeira Escolar")
