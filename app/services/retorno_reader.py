@@ -48,18 +48,28 @@ class RetornoReader:
             # Posições conforme Manual Bradesco Págs. 31-32
             nosso_numero_raw = linha[70:82].strip()
             nosso_numero = nosso_numero_raw.lstrip('0')  # Limpa zeros à esquerda (ex: "94851")
-            
-            valor_pago = float(linha[253:266]) / 100     # Posições 254-266
-            data_ocorrencia = linha[110:116]             # DDMMAA (Posições 111-116)
-            codigo_ocorrencia = linha[108:110]           # Posições 109-110
+            # DAC do Nosso Número: Posição 83 (Índice Python 82:83)
+            dac = linha[82:83].strip()
+
+            # Código de Ocorrência: Posições 109 a 110 (Índice Python 108:110)
+            codigo_ocorrencia = linha[108:110].strip()
+
+            # Data da Ocorrência (Liquidação): Posições 111 a 116 - DDMMAA (Índice Python 109:115)
+            data_ocorrencia_str = linha[109:115].strip()
+            data_ocorrencia = datetime.strptime(data_ocorrencia_str, '%d%m%y').strftime('%Y-%m-%d')
+
+            # Valor Pago: Posições 254 a 266 (Índice Python 253:266)
+            valor_pago = float(linha[253:266]) / 100
 
             self.registros.append({
                 'linha': num_linha,
                 'nosso_numero': nosso_numero,
+                'dac': dac,
                 'valor': valor_pago,
-                'data': datetime.strptime(data_ocorrencia, '%d%m%y').strftime('%Y-%m-%d'),
+                'data': data_ocorrencia,
                 'ocorrencia': codigo_ocorrencia,
-                'nome_pagador': None  # No CNAB 400 Retorno, o nome deve ser buscado via De-Para na Remessa
+                'nome_pagador': None  # No CNAB 400 Retorno, o nome é obtido via De-Para com a Remessa
             })
+            
         except (ValueError, IndexError) as e:
-            logger.warning(f"Falha ao processar linha {num_linha}: {e}")
+            logger.warning(f"Falha ao processar linha de detalhe {num_linha}: {e}")

@@ -26,7 +26,7 @@ def sincronizar_retorno(caminho_ret: str):
     """
     reader = RetornoReader(caminho_ret)
     reader.processar()
-    registros = reader.registros   # já está acessível como atributo
+    registros = reader.registros
 
     if not registros:
         logger.warning("Nenhum registro de retorno encontrado.")
@@ -38,6 +38,7 @@ def sincronizar_retorno(caminho_ret: str):
         for reg in registros:
             dados_insert.append({
                 "nosso_numero": reg["nosso_numero"],
+                "dac": reg.get("dac"),
                 "nome_pagador": reg.get("nome_pagador", "").strip().upper(),
                 "valor_pago": reg["valor"],
                 "data_pagamento": reg["data"],
@@ -48,9 +49,10 @@ def sincronizar_retorno(caminho_ret: str):
 
         session.execute(
             text("""
-                INSERT INTO retorno (nosso_numero, nome_pagador, valor_pago, data_pagamento, codigo_ocorrencia, arquivo_origem, status)
-                VALUES (:nosso_numero, :nome_pagador, :valor_pago, :data_pagamento, :codigo_ocorrencia, :arquivo_origem, :status)
+                INSERT INTO retorno (nosso_numero, dac, nome_pagador, valor_pago, data_pagamento, codigo_ocorrencia, arquivo_origem, status)
+                VALUES (:nosso_numero, :dac, :nome_pagador, :valor_pago, :data_pagamento, :codigo_ocorrencia, :arquivo_origem, :status)
                 ON CONFLICT (nosso_numero) DO UPDATE SET
+                    dac = EXCLUDED.dac,
                     nome_pagador = EXCLUDED.nome_pagador,
                     valor_pago = EXCLUDED.valor_pago,
                     data_pagamento = EXCLUDED.data_pagamento,
