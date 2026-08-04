@@ -16,13 +16,13 @@ def obter_configuracao():
     """
     with engine.connect() as conn:
         result = conn.execute(
-            text("SELECT conta_financeira_id, categoria_id FROM conta_azul_config LIMIT 1")
+            text("SELECT conta_financeira, categoria FROM conta_azul_config LIMIT 1")
         ).first()
         
         if result:
             return {
-                "conta_financeira_id": result.conta_financeira_id,
-                "categoria_id": result.categoria_id
+                "conta_financeira_id": result.conta_financeira,
+                "categoria_id": result.categoria
             }
         return None
 
@@ -31,25 +31,13 @@ def definir_configuracao(conta_financeira_id: str, categoria_id: str):
     Salva ou atualiza a conta bancária e categoria de receita padrão na tabela do banco de dados.
     """
     with engine.begin() as conn:
-        # Garante a existência da tabela caso não tenha sido criada
-        conn.execute(
-            text("""
-                CREATE TABLE IF NOT EXISTS conta_azul_config (
-                    id SERIAL PRIMARY KEY,
-                    conta_financeira_id VARCHAR(255) NOT NULL,
-                    categoria_id VARCHAR(255) NOT NULL,
-                    atualizado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-            """)
-        )
-
         # Limpa registros antigos para manter apenas a configuração vigente
         conn.execute(text("DELETE FROM conta_azul_config;"))
         
-        # Insere a nova configuração ativa
+        # Insere a nova configuração ativa usando os nomes de colunas existentes no banco
         conn.execute(
             text("""
-                INSERT INTO conta_azul_config (conta_financeira_id, categoria_id)
+                INSERT INTO conta_azul_config (conta_financeira, categoria)
                 VALUES (:conta_id, :cat_id);
             """),
             {"conta_id": conta_financeira_id, "cat_id": categoria_id}
