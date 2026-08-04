@@ -8,6 +8,7 @@ from .conta_azul_utils import (
     obter_configuracao,
     obter_ou_criar_categoria,
     obter_ou_criar_contato,
+    registrar_log_erro,
 )
 
 # Configuração do logger local para rastreamento de operações financeiras
@@ -79,6 +80,7 @@ def criar_receita_com_baixa(
                     "conta_financeira": id_conta_final,
                     "detalhe_valor": {
                         "valor_bruto": valor,
+                        "valor_liquido": valor,
                         "multa": 0,
                         "juros": 0,
                         "desconto": 0,
