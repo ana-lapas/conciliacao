@@ -1,88 +1,125 @@
 # app.py
-import streamlit as st
-import pandas as pd
+import logging
 import os
 import tempfile
-from dotenv import load_dotenv, find_dotenv
+import pandas as pd
+import streamlit as st
+from dotenv import find_dotenv, load_dotenv
 from sqlalchemy import create_engine, text
-from app.services.sofia_api import SofiaAPI
-from app.services.conta_azul_utils import listar_contas_financeiras, listar_categorias_receita, definir_configuracao
-from app.services.remessa_sync import sincronizar_remessa
-from app.services.retorno_sync import sincronizar_retorno
-from app.services.matcher import conciliar_retorno
-from app.services.conta_azul import get_authorization_url, exchange_code, get_credentials
-import logging
 
+# --- IMPORTAÇÃO DOS SERVIÇOS DO BACKEND ---
+# Importamos as funções que conversam com as APIs externas (Conta Azul e Sofia) e tratam os arquivos
+from app.services.conta_azul import (
+    exchange_code,          # Troca o código temporário do OAuth2 pelo token de acesso
+    get_authorization_url, # Gera o link para o usuário logar no Conta Azul
+    get_credentials,       # Busca os tokens salvos no banco de dados local
+)
+from app.services.conta_azul_utils import (
+    definir_configuracao,      # Salva a conta bancária e categoria padrão selecionadas
+    listar_categorias_receita,  # Busca categorias financeiras da API do Conta Azul
+    listar_contas_financeiras,  # Busca contas bancárias da API do Conta Azul
+    obter_configuracao,
+    obter_ou_criar_categoria,
+    obter_ou_criar_contato,
+    traduzir_erro_para_usuario,
+)
+from app.services.matcher import conciliar_retorno  # Motor que cruza pagamentos com a API da Sofia
+from app.services.remessa_sync import sincronizar_remessa # Lógica que lê o arquivo .rem e salva no banco
+from app.services.retorno_sync import sincronizar_retorno # Lógica que lê o arquivo .ret e salva no banco
+from app.services.sofia_api import SofiaAPI               # Cliente HTTP para a API escolar Sofia
+
+# -----------------------------------------------------------------------------
+# 1. CONFIGURAÇÕES INICIAIS E BANCO DE DADOS
+# -----------------------------------------------------------------------------
+# Carrega as variáveis de ambiente (.env) como URLs, senhas e chaves de API
 load_dotenv(find_dotenv())
+
+# Configura o sistema de logs para exibir informações no terminal para debug
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    force=True   # <- força a reconfiguração, mesmo que outro módulo já tenha configurado
+    force=True,
 )
 
+# Configura a página do Streamlit (título da aba do navegador e layout largo)
 st.set_page_config(page_title="Conciliação Financeira", layout="wide")
 st.title("🔄 Conciliação Financeira Escolar")
 
-# Conexão com o banco
+# Cria o pool de conexões com o banco de dados PostgreSQL
 DATABASE_URL = os.getenv("DATABASE_URL")
 engine = create_engine(DATABASE_URL)
 
-st.title("🔄 Conciliação Financeira Escolar")
-
-# --- NOVO: Dashboard Rápido ---
+# -----------------------------------------------------------------------------
+# 2. DASHBOARDS E MÉTRICAS (Roda a cada refresh da página)
+# -----------------------------------------------------------------------------
+# Executa consultas rápidas no banco para alimentar os cartões de resumo no topo da tela
 with engine.connect() as conn:
-    qtd_pendentes = conn.execute(text("SELECT COUNT(*) FROM payment_match WHERE status = 'PENDENTE_REVISAO'")).scalar()
-    qtd_prontos = conn.execute(text("SELECT COUNT(*) FROM payment_match WHERE status = 'CONCILIADO' AND conta_azul_receita_id IS NULL")).scalar()
+    # Conta quantos boletos precisam de atenção humana
+    qtd_pendentes = conn.execute(
+        text("SELECT COUNT(*) FROM payment_match WHERE status = 'PENDENTE_REVISAO'")
+    ).scalar()
+    
+    # Conta quantos boletos foram aprovados mas ainda não subiram para o Conta Azul
+    qtd_prontos = conn.execute(
+        text(
+            "SELECT COUNT(*) FROM payment_match WHERE status = 'CONCILIADO' AND conta_azul_receita_id IS NULL"
+        )
+    ).scalar()
 
+# Desenha 3 colunas para exibir os números em destaque
 col1, col2, col3 = st.columns(3)
 col1.metric("Pendentes de Revisão", qtd_pendentes, delta_color="inverse")
 col2.metric("Prontos p/ Envio Conta Azul", qtd_prontos)
-st.divider() 
+st.divider()
+
 # -----------------------------------------------------------------------------
-# Abas
+# 3. ESTRUTURA DE ABAS DA APLICAÇÃO
 # -----------------------------------------------------------------------------
 tab1, tab2, tab3, tab4 = st.tabs([
     "📂 Processar Arquivos",
     "🔍 Revisão Manual",
     "📋 Conciliações Prontas",
-    "💳 Conta Azul"
+    "💳 Conta Azul",
 ])
 
 # =============================================================================
-# Aba 1: Upload e Conciliação Automática
+# ABA 1: UPLOAD DE ARQUIVOS E CONCILIAÇÃO AUTOMÁTICA
 # =============================================================================
 with tab1:
     st.header("Upload e Conciliação")
 
+    # Campo onde o usuário digita a pasta local onde os arquivos físicos serão salvos
     pasta_destino = st.text_input(
         "Pasta para salvar os arquivos (caminho completo no computador):",
-        value=os.path.expanduser("~/documentos_recebidos")
+        value=os.path.expanduser("~/documentos_recebidos"),
     )
 
+    # Componentes de Upload (Desacoplados: permite subir .ret, .rem ou ambos)
     col1, col2 = st.columns(2)
     with col1:
         ret_files = st.file_uploader(
-            "Arquivos de Retorno (.ret) - obrigatório para conciliação",
+            "Arquivos de Retorno (.ret) - opcional se enviar remessa",
             type=["ret"],
             accept_multiple_files=True,
-            key="ret"
+            key="ret",
         )
     with col2:
         rem_files = st.file_uploader(
-            "Arquivos de Remessa (.rem) - obrigatório para conciliação",
+            "Arquivos de Remessa (.rem) - opcional se enviar retorno",
             type=["rem"],
             accept_multiple_files=True,
-            key="rem"
+            key="rem",
         )
 
+    # Botão principal de processamento
     if st.button("Processar Conciliação", type="primary"):
-        if not ret_files:
-            st.error("Pelo menos um arquivo de retorno é obrigatório.")
-        elif not rem_files:
-            st.error("Pelo menos um arquivo de remessa é obrigatório.")
+        # Validação: impede o clique se nenhum arquivo foi selecionado
+        if not ret_files and not rem_files:
+            st.error("⚠️ Envie pelo menos um arquivo (Retorno ou Remessa) para processar.")
         elif not pasta_destino.strip():
-            st.error("Informe uma pasta de destino.")
+            st.error("⚠️ Informe uma pasta de destino.")
         else:
+            # Garante que o diretório de destino existe no sistema operacional
             try:
                 os.makedirs(pasta_destino, exist_ok=True)
             except Exception as e:
@@ -90,47 +127,64 @@ with tab1:
                 st.stop()
 
             arquivos_salvos = []
-            try:
-                with st.spinner("Salvando e importando retorno(s)..."):
-                    for ret_file in ret_files:
-                        caminho = os.path.join(pasta_destino, ret_file.name)
-                        with open(caminho, "wb") as f:
-                            f.write(ret_file.getbuffer())
-                        arquivos_salvos.append(caminho)
-                        sincronizar_retorno(caminho)
-                    st.success(f"{len(ret_files)} arquivo(s) de retorno importado(s).")
 
-                if rem_files:
+            # Bloco A: Processa arquivos de retorno (.ret) se existirem
+            if ret_files:
+                try:
+                    with st.spinner("Salvando e importando retorno(s)..."):
+                        for ret_file in ret_files:
+                            caminho = os.path.join(pasta_destino, ret_file.name)
+                            # Grava o arquivo físico em disco
+                            with open(caminho, "wb") as f:
+                                f.write(ret_file.getbuffer())
+                            arquivos_salvos.append(caminho)
+                            # Chama o serviço que faz o parse do arquivo CNAB e salva no PostgreSQL
+                            sincronizar_retorno(caminho)
+                        st.success(f"✅ {len(ret_files)} arquivo(s) de retorno importado(s).")
+                except Exception as e:
+                    st.error(f"❌ Erro ao processar arquivo(s) de retorno: {e}")
+
+            # Bloco B: Processa arquivos de remessa (.rem) se existirem
+            if rem_files:
+                try:
                     with st.spinner("Salvando e importando remessa(s)..."):
                         for rem_file in rem_files:
                             caminho = os.path.join(pasta_destino, rem_file.name)
+                            # Grava o arquivo físico em disco
                             with open(caminho, "wb") as f:
                                 f.write(rem_file.getbuffer())
                             arquivos_salvos.append(caminho)
+                            # Chama o serviço que lê os dados de cobrança da remessa e salva no banco
                             sincronizar_remessa(caminho)
-                        st.success(f"{len(rem_files)} arquivo(s) de remessa importado(s).")
+                        st.success(f"✅ {len(rem_files)} arquivo(s) de remessa importado(s).")
+                except Exception as e:
+                    st.error(f"❌ Erro ao processar arquivo(s) de remessa: {e}")
 
-                with st.spinner("Executando conciliação automática..."):
+            # Bloco C: Conecta na API Sofia e executa a regra de conciliação automática
+            try:
+                with st.spinner("Executando motor de conciliação automática..."):
                     api = SofiaAPI(
                         os.getenv("SOFIA_BASE_URL"),
                         os.getenv("SOFIA_TENANT"),
                         os.getenv("SOFIA_USUARIO"),
-                        os.getenv("SOFIA_SENHA")
+                        os.getenv("SOFIA_SENHA"),
                     )
                     api.autenticar()
+                    # Compara as entradas do banco com os alunos cadastrados na API Sofia
                     conciliar_retorno(api)
-                    st.success("Conciliação concluída! Verifique a aba de Revisão Manual.")
-
-                st.info(f"📁 Arquivos salvos em: {pasta_destino}")
+                    st.success("🚀 Conciliação concluída! Verifique a aba de Revisão Manual.")
             except Exception as e:
-                st.error(f"Erro durante o processamento: {e}")
+                st.error(f"❌ Erro na comunicação com o sistema Sofia: {e}")
+
+            st.info(f"📁 Arquivos salvos localmente em: {pasta_destino}")
 
 # =============================================================================
-# Aba 2: Revisão Manual
+# ABA 2: REVISÃO MANUAL DE PAGAMENTOS
 # =============================================================================
 with tab2:
     st.header("Pagamentos Pendentes de Revisão")
 
+    # Busca no banco apenas os pagamentos marcados como 'PENDENTE_REVISAO'
     with engine.connect() as conn:
         pendentes = conn.execute(
             text("""
@@ -143,23 +197,76 @@ with tab2:
         ).fetchall()
 
     if pendentes:
-        df = pd.DataFrame(pendentes, columns=["ID", "Retorno ID", "Nosso Número", "Nome Atual", "Valor Pago", "Data Pagamento", "Mensagem"])
-        st.dataframe(df, width='stretch')
+        # Converte os resultados do SQL em um DataFrame Pandas para a tabela
+        df = pd.DataFrame(
+            pendentes,
+            columns=[
+                "ID",
+                "Retorno ID",
+                "Nosso Número",
+                "Nome Atual",
+                "Valor Pago",
+                "Data Pagamento",
+                "Mensagem",
+            ],
+        )
 
-        st.subheader("Editar Pagamento")
-        selected_id = st.selectbox("Selecione o ID do registro:", df["ID"].tolist())
+        st.write("👆 **Selecione uma linha na tabela abaixo para editar:**")
 
-        if selected_id:
-            row = df[df["ID"] == selected_id].iloc[0]
-            novo_nome = st.text_input("Nome real do pagador (conforme boleto/PDF):", value=row["Nome Atual"])
-            if st.button("Aprovar e Enviar para Conta Azul"):
+        # Exibe a tabela e permite que o usuário clique em uma linha
+        evento = st.dataframe(
+            df,
+            width="stretch",
+            hide_index=True,
+            selection_mode="single-row",
+            on_select="rerun", # Recarrega o script assim que uma linha for clicada
+        )
+
+        # Captura o índice da linha que o usuário clicou
+        linhas_selecionadas = evento.selection.rows
+
+        # Se houver uma linha selecionada, desenha o formulário de edição abaixo da tabela
+        if linhas_selecionadas:
+            idx_linha = linhas_selecionadas[0]
+            row = df.iloc[idx_linha]
+            selected_id = int(row["ID"])
+
+            st.subheader(f"Editando pagamento: {row['Nosso Número']}")
+            # Campo para o operador corrigir o nome do aluno/responsável se o matcher automático falhou
+            novo_nome = st.text_input(
+                "Nome real do pagador (conforme boleto/PDF):", value=row["Nome Atual"]
+            )
+
+            # Botão de ação: Aprova e envia para o ERP
+            if st.button("Aprovar e Enviar para Conta Azul", type="primary"):
+                # Abre transação no banco (engine.begin) para garantir atomicidade
                 with engine.begin() as conn:
-                    # 1. Atualiza nome e status
+                    
+                    # --- 1. TRAVA DE CONCORRÊNCIA (PESSIMISTIC LOCKING) ---
+                    # Bloqueia a linha no PostgreSQL (FOR UPDATE) para impedir que outro usuário
+                    # altere o mesmo registro no mesmo milissegundo.
+                    status_atual = conn.execute(
+                        text("SELECT status FROM payment_match WHERE id = :id FOR UPDATE"),
+                        {"id": selected_id},
+                    ).scalar()
+
+                    # Se outro usuário já tiver aprovado este item enquanto esta tela estava aberta, aborta.
+                    if status_atual != "PENDENTE_REVISAO":
+                        st.warning(
+                            "⚠️ Este pagamento já foi processado ou alterado por outro usuário. Recarregando..."
+                        )
+                        st.rerun()
+
+                    # --- 2. ATUALIZAÇÕES LOCAIS NO BANCO ---
+                    # Salva o nome corrigido e muda o status para CONCILIADO
                     conn.execute(
-                        text("UPDATE payment_match SET nome_responsavel = :nome, status = 'CONCILIADO' WHERE id = :id"),
-                        {"nome": novo_nome.strip().upper(), "id": selected_id}
+                        text(
+                            "UPDATE payment_match SET nome_responsavel = :nome, status = 'CONCILIADO' WHERE id = :id"
+                        ),
+                        {"nome": novo_nome.strip().upper(), "id": selected_id},
                     )
-                    # 2. Copia valores do retorno e data de vencimento da remessa (se existir)
+
+                    # Copia valores consolidados da tabela de retorno e remessa para a tabela de conciliação
                     conn.execute(
                         text("""
                             UPDATE payment_match pm
@@ -171,67 +278,102 @@ with tab2:
                             LEFT JOIN remessa rem ON rem.nosso_numero = r.nosso_numero
                             WHERE pm.id = :pm_id AND r.id = :ret_id
                         """),
-                        {"pm_id": selected_id, "ret_id": int(row["Retorno ID"])}
+                        {"pm_id": selected_id, "ret_id": int(row["Retorno ID"])},
                     )
 
-                    # 3. Descrição da remessa
+                    # Concatena as mensagens da remessa para formar o histórico financeiro
                     descricao = None
                     row_desc = conn.execute(
-                        text("SELECT mensagem1, mensagem2, mensagem3, mensagem4 FROM remessa_mensagem WHERE nosso_numero = :nn"),
-                        {"nn": row["Nosso Número"]}
+                        text(
+                            "SELECT mensagem1, mensagem2, mensagem3, mensagem4 FROM remessa_mensagem WHERE nosso_numero = :nn"
+                        ),
+                        {"nn": row["Nosso Número"]},
                     ).first()
+
                     if row_desc:
-                        partes = [row_desc.mensagem1, row_desc.mensagem2, row_desc.mensagem3, row_desc.mensagem4]
+                        partes = [
+                            row_desc.mensagem1,
+                            row_desc.mensagem2,
+                            row_desc.mensagem3,
+                            row_desc.mensagem4,
+                        ]
                         descricao = " | ".join(p for p in partes if p)
                         conn.execute(
-                            text("UPDATE payment_match SET descricao_pagamento = :desc WHERE id = :id"),
-                            {"desc": descricao, "id": selected_id}
+                            text(
+                                "UPDATE payment_match SET descricao_pagamento = :desc WHERE id = :id"
+                            ),
+                            {"desc": descricao, "id": selected_id},
                         )
 
-                    # 4. Envio ao Conta Azul
+                    # --- 3. ENVIO SÍNCRONO PARA O CONTA AZUL ---
                     try:
-                        from app.services.conta_azul_receitas import criar_receita_com_baixa
-                        descricao_completa = f"{descricao or 'Boleto'} - Aluno: {novo_nome.strip().upper()}"
-                        data_pagamento_str = row["Data Pagamento"].strftime('%Y-%m-%d') if hasattr(row["Data Pagamento"], 'strftime') else str(row["Data Pagamento"])
+                        from app.services.conta_azul_receitas import (
+                            criar_receita_com_baixa,
+                        )
 
+                        descricao_completa = (
+                            f"{descricao or 'Boleto'} - Aluno: {novo_nome.strip().upper()}"
+                        )
+                        data_pagamento_str = (
+                            row["Data Pagamento"].strftime("%Y-%m-%d")
+                            if hasattr(row["Data Pagamento"], "strftime")
+                            else str(row["Data Pagamento"])
+                        )
+
+                        # Envia a requisição HTTP POST para criar a receita no ERP Conta Azul
                         parcela_id = criar_receita_com_baixa(
                             data_vencimento=data_pagamento_str,
                             valor=float(row["Valor Pago"]),
                             descricao=descricao_completa,
                             nome_cliente=novo_nome.strip().upper(),
-                            data_pagamento=data_pagamento_str
+                            data_pagamento=data_pagamento_str,
                         )
+                        
+                        # Salva o ID retornado pela API do Conta Azul para confirmar a integração
                         conn.execute(
-                            text("UPDATE payment_match SET conta_azul_receita_id = :caid WHERE id = :id"),
-                            {"caid": parcela_id, "id": selected_id}
+                            text(
+                                "UPDATE payment_match SET conta_azul_receita_id = :caid WHERE id = :id"
+                            ),
+                            {"caid": parcela_id, "id": selected_id},
                         )
                         st.success("Pagamento aprovado e receita criada no Conta Azul!")
+                    
                     except Exception as e:
+                        # Se der erro na API externa, registra a mensagem no banco sem desfazer a conciliação local
                         conn.execute(
                             text("UPDATE payment_match SET mensagem = :msg WHERE id = :id"),
-                            {"msg": f"Erro Conta Azul: {str(e)[:200]}", "id": selected_id}
+                            {
+                                "msg": f"Erro Conta Azul: {str(e)[:200]}",
+                                "id": selected_id,
+                            },
                         )
-                        st.warning(f"Pagamento aprovado, mas houve falha ao enviar para o Conta Azul: {e}. Você pode reenviar depois.")
+                        st.warning(
+                            f"Pagamento aprovado, mas houve falha ao enviar para o Conta Azul: {e}."
+                        )
+
+                # Força o Streamlit a recarregar a tela para sumir com a linha processada
                 st.rerun()
     else:
         st.info("Nenhum pagamento pendente de revisão.")
+
 # =============================================================================
-# Aba 3: Conciliações Prontas (revisão final, exportação e envio ao Conta Azul)
+# ABA 3: CONCILIAÇÕES PRONTAS E REENVIOS
 # =============================================================================
 with tab3:
     st.header("Pagamentos Conciliados (Prontos para Exportação)")
 
     with engine.connect() as conn:
+        # Usa LEFT JOIN em vez de JOIN simples para garantir que registros
+        # sem arquivo de retorno associado não fiquem "fantasmas" sumidos da listagem
         conciliados = conn.execute(
             text("""
-                SELECT pm.id, pm.retorno_id, r.nosso_numero, pm.nome_responsavel,
-                    pm.cpf_responsavel,
-                    COALESCE(pm.valor_pago, r.valor_pago) AS valor_pago,
-                    COALESCE(pm.data_pagamento, r.data_pagamento) AS data_pagamento,
-                    pm.data_vencimento,
-                    pm.mensagem, pm.conta_azul_receita_id
+                SELECT pm.id, pm.retorno_id, COALESCE(r.nosso_numero, 'N/A') AS nosso_numero, 
+                       pm.nome_responsavel, pm.cpf_responsavel,
+                       COALESCE(pm.valor_pago, r.valor_pago, 0) AS valor_pago,
+                       COALESCE(pm.data_pagamento, r.data_pagamento) AS data_pagamento,
+                       pm.data_vencimento, pm.mensagem, pm.conta_azul_receita_id
                 FROM payment_match pm
-                JOIN retorno r ON r.id = pm.retorno_id
+                LEFT JOIN retorno r ON r.id = pm.retorno_id
                 WHERE pm.status = 'CONCILIADO'
             """)
         ).fetchall()
@@ -239,90 +381,161 @@ with tab3:
     if conciliados:
         df_conciliados = pd.DataFrame(
             conciliados,
-            columns=["ID", "Retorno ID", "Nosso Número", "Nome Responsável",
-                     "CPF", "Valor Pago", "Data Pagamento", "Vencimento",
-                     "Mensagem", "Enviado ao Conta Azul?"]
+            columns=[
+                "ID",
+                "Retorno ID",
+                "Nosso Número",
+                "Nome Responsável",
+                "CPF",
+                "Valor Pago",
+                "Data Pagamento",
+                "Vencimento",
+                "Mensagem",
+                "Enviado ao Conta Azul?",
+            ],
         )
-        # Substitui None por "Não" e preenche com "Sim" se houver ID
-        df_conciliados["Enviado ao Conta Azul?"] = df_conciliados["Enviado ao Conta Azul?"].apply(
-            lambda x: "Sim" if x else "Não"
-        )
-        st.dataframe(df_conciliados, width='stretch')
+        # Formata a coluna de ID do Conta Azul para uma resposta visual simples (Sim/Não)
+        df_conciliados["Enviado ao Conta Azul?"] = df_conciliados[
+            "Enviado ao Conta Azul?"
+        ].apply(lambda x: "Sim" if x else "Não")
 
-        # Seção de ações rápidas
+        st.write("👆 **Selecione uma linha para reabrir o registro:**")
+
+        # Tabela interativa para seleção de conciliações prontas
+        evento_tab3 = st.dataframe(
+            df_conciliados,
+            width="stretch",
+            hide_index=True,
+            selection_mode="single-row",
+            on_select="rerun",
+        )
+
+        linhas_sel_tab3 = evento_tab3.selection.rows
+
         st.subheader("Ações")
         col1, col2 = st.columns(2)
 
         with col1:
-            selected_id = st.selectbox("Selecione um registro para reabrir:", df_conciliados["ID"].tolist())
-            if st.button("Reabrir Registro (voltar para Revisão)"):
-                with engine.begin() as conn:
-                    conn.execute(
-                        text("UPDATE payment_match SET status = 'PENDENTE_REVISAO' WHERE id = :id"),
-                        {"id": selected_id}
-                    )
-                    conn.execute(
-                        text("UPDATE retorno SET status = 'PENDENTE_REVISAO' WHERE id = :rid"),
-                        {"rid": int(df_conciliados[df_conciliados["ID"] == selected_id]["Retorno ID"].iloc[0])}
-                    )
-                st.success("Registro reaberto para revisão.")
-                st.rerun()
+            if linhas_sel_tab3:
+                idx_linha = linhas_sel_tab3[0]
+                row_selecionada = df_conciliados.iloc[idx_linha]
+                selected_id_tab3 = int(row_selecionada["ID"])
+
+                st.info(f"Registro selecionado: **{row_selecionada['Nosso Número']}**")
+
+                # Botão para estornar a conciliação e mandá-la de volta para a Aba 2 (Revisão)
+                if st.button("Reabrir Registro Selecionado", type="primary"):
+                    with engine.begin() as conn:
+                        # TRAVA DE CONCORRÊNCIA: Verifica se o item ainda está com status CONCILIADO
+                        status_atual = conn.execute(
+                            text("SELECT status FROM payment_match WHERE id = :id FOR UPDATE"),
+                            {"id": selected_id_tab3},
+                        ).scalar()
+
+                        if status_atual != "CONCILIADO":
+                            st.warning(
+                                "⚠️ Este registro não está mais conciliado. Recarregando..."
+                            )
+                            st.rerun()
+
+                        # Volta o status para PENDENTE_REVISAO nas tabelas correspondentes
+                        conn.execute(
+                            text(
+                                "UPDATE payment_match SET status = 'PENDENTE_REVISAO' WHERE id = :id"
+                            ),
+                            {"id": selected_id_tab3},
+                        )
+
+                        if row_selecionada["Retorno ID"] and pd.notna(
+                            row_selecionada["Retorno ID"]
+                        ):
+                            conn.execute(
+                                text(
+                                    "UPDATE retorno SET status = 'PENDENTE_REVISAO' WHERE id = :rid"
+                                ),
+                                {"rid": int(row_selecionada["Retorno ID"])},
+                            )
+
+                    st.success("Registro reaberto para revisão.")
+                    st.rerun()
+            else:
+                st.write("*Selecione um registro na tabela para reabrir.*")
 
         with col2:
+            # Exportação de relatório em CSV
             if st.button("Exportar CSV (todos os conciliados)"):
                 csv = df_conciliados.to_csv(index=False, sep=";")
                 st.download_button(
                     label="Baixar CSV",
                     data=csv,
-                    file_name="conciliações_prontas.csv",
-                    mime="text/csv"
+                    file_name="conciliacoes_prontas.csv",
+                    mime="text/csv",
                 )
 
-        # Seção de envio ao Conta Azul
+        # Seção para reprocessar erros de envio para o Conta Azul
         st.subheader("Envio ao Conta Azul")
-        # Conta quantos ainda não foram enviados
         nao_enviados = df_conciliados[df_conciliados["Enviado ao Conta Azul?"] == "Não"]
+
         if not nao_enviados.empty:
-            st.info(f"Existem {len(nao_enviados)} registro(s) ainda não enviados ao Conta Azul.")
+            st.info(
+                f"Existem {len(nao_enviados)} registro(s) ainda não enviados ao Conta Azul."
+            )
             if st.button("Reenviar todos os não enviados"):
                 progresso = st.progress(0)
                 sucessos = 0
                 falhas = 0
                 total = len(nao_enviados)
+
+                # Itera item por item enviando para a API e atualizando a barra de progresso
                 for i, (idx, row) in enumerate(nao_enviados.iterrows()):
                     try:
-                        # Busca a descrição (se houver)
-                        descricao = row.get("descricao_pagamento")  # coluna ainda não existe no DataFrame, mas vamos ignorar
-                        # Como não temos a descrição no select, faremos um novo select rápido
                         with engine.connect() as conn2:
                             desc_row = conn2.execute(
-                                text("SELECT descricao_pagamento FROM payment_match WHERE id = :id"),
-                                {"id": row["ID"]}
+                                text(
+                                    "SELECT descricao_pagamento FROM payment_match WHERE id = :id"
+                                ),
+                                {"id": row["ID"]},
                             ).first()
                             descricao_atual = desc_row[0] if desc_row else None
-                        from app.services.conta_azul_receitas import criar_receita_com_baixa
+
+                        from app.services.conta_azul_receitas import (
+                            criar_receita_com_baixa,
+                        )
 
                         descricao_completa = f"{descricao_atual or 'Boleto'} - Aluno: {row['Nome Responsável']}"
+
                         parcela_id = criar_receita_com_baixa(
                             data_vencimento=str(row["Data Pagamento"]),
                             valor=float(row["Valor Pago"]),
                             descricao=descricao_completa,
                             nome_cliente=row["Nome Responsável"],
-                            data_pagamento=str(row["Data Pagamento"])      # pago na mesma data
+                            data_pagamento=str(row["Data Pagamento"]),
                         )
-                        conn3.execute(
-                            text("UPDATE payment_match SET conta_azul_receita_id = :caid WHERE id = :id"),
-                            {"caid": parcela_id, "id": row["ID"]}
-                        )
+
+                        with engine.begin() as conn3:
+                            conn3.execute(
+                                text(
+                                    "UPDATE payment_match SET conta_azul_receita_id = :caid WHERE id = :id"
+                                ),
+                                {"caid": parcela_id, "id": row["ID"]},
+                            )
                         sucessos += 1
+
                     except Exception as e:
                         falhas += 1
                         with engine.begin() as conn3:
                             conn3.execute(
-                                text("UPDATE payment_match SET mensagem = :msg WHERE id = :id"),
-                                {"msg": f"Erro no reenvio: {str(e)[:200]}", "id": row["ID"]}
+                                text(
+                                    "UPDATE payment_match SET mensagem = :msg WHERE id = :id"
+                                ),
+                                {
+                                    "msg": f"Erro no reenvio: {str(e)[:200]}",
+                                    "id": row["ID"],
+                                },
                             )
+                    # Atualiza a barra de progresso visual
                     progresso.progress((i + 1) / total)
+
                 st.success(f"Reenvio concluído: {sucessos} sucessos, {falhas} falhas.")
                 st.rerun()
         else:
@@ -331,27 +544,32 @@ with tab3:
         st.info("Nenhum pagamento conciliado no momento.")
 
 # =============================================================================
-# Aba 4: Conta Azul (conexão OAuth)
+# ABA 4: AUTENTICAÇÃO E CONFIGURAÇÃO DA API CONTA AZUL (OAuth2)
 # =============================================================================
 with tab4:
     st.header("Conexão Conta Azul")
 
-    # Capturar code da URL (callback)
+    # Lê os parâmetros 'code' e 'state' retornados na URL após o login no Conta Azul
     params = st.query_params
     code = params.get("code", None)
     state = params.get("state", None)
 
+    # Se a URL contém o código de autorização, executa a troca pelo Access Token
     if code:
         with st.spinner("Autorizando..."):
             try:
-                # Em vez de bloquear, apenas avisa se o state não bater
                 expected_state = st.session_state.get("oauth_state")
                 if expected_state and state != expected_state:
-                    st.warning("Aviso de segurança: state não corresponde. Continuando mesmo assim.")
+                    st.warning(
+                        "Aviso de segurança: state não corresponde. Continuando mesmo assim."
+                    )
                 exchange_code(code, state)
                 st.success("Autorizado com sucesso!")
-                # Limpa os parâmetros da URL
-                new_params = {k: v for k, v in st.query_params.items() if k not in ("code", "state")}
+                
+                # Limpa os parâmetros da URL para evitar reutilizar o 'code' expirado
+                new_params = {
+                    k: v for k, v in st.query_params.items() if k not in ("code", "state")
+                }
                 st.query_params.clear()
                 st.query_params.update(new_params)
                 st.rerun()
@@ -359,33 +577,40 @@ with tab4:
                 st.error(f"Erro na autorização: {e}")
                 st.exception(e)
 
-    # Verificar se já está conectado
+    # Verifica se já temos um Access Token válido salvo na tabela local
     creds = get_credentials()
     if creds and creds.get("access_token"):
-        st.success(f"Conectado! Token válido até {creds['expires_at'].strftime('%d/%m/%Y %H:%M')}")
-        # Futuramente: opção de exportar via API ou gerar lote
+        st.success(
+            f"Conectado! Token válido até {creds['expires_at'].strftime('%d/%m/%Y %H:%M')}"
+        )
     else:
+        # Se não estiver conectado, gera o link de autorização OAuth2
         auth_url, state = get_authorization_url()
         st.session_state["oauth_state"] = state
         st.link_button("Conectar com Conta Azul", url=auth_url)
 
     st.subheader("Configurar contas e categorias")
-    
-    # 1. Carrega e exibe as contas financeiras (você já tinha isso)
+
+    # Botão para consultar a API do Conta Azul e listar as contas/categorias do usuário
     if st.button("Carregar contas financeiras e categorias"):
         st.session_state.contas = listar_contas_financeiras()
-        st.session_state.categorias = listar_categorias_receita() # Nova função do backend!
+        st.session_state.categorias = listar_categorias_receita()
 
+    # Exibe os seletores e salva os mapeamentos padrão no banco
     if "contas" in st.session_state and "categorias" in st.session_state:
-        # Cria os dicionários para o selectbox
         opcoes_conta = {c["nome"]: c["id"] for c in st.session_state.contas}
         opcoes_cat = {c["nome"]: c["id"] for c in st.session_state.categorias}
-        
-        # O usuário seleciona visualmente pelo nome, mas o sistema guarda o UUID
-        conta_selecionada = st.selectbox("Selecione a Conta Bancária:", list(opcoes_conta.keys()))
-        cat_selecionada = st.selectbox("Selecione a Categoria de Receita:", list(opcoes_cat.keys()))
-        
+
+        conta_selecionada = st.selectbox(
+            "Selecione a Conta Bancária:", list(opcoes_conta.keys())
+        )
+        cat_selecionada = st.selectbox(
+            "Selecione a Categoria de Receita:", list(opcoes_cat.keys())
+        )
+
         if st.button("Salvar configuração"):
-            # Salva no banco de dados local os UUIDs exatos que a Conta Azul espera
-            definir_configuracao(opcoes_conta[conta_selecionada], opcoes_cat[cat_selecionada])
+            # Mapeia os UUIDs selecionados para uso nos payloads das receitas
+            definir_configuracao(
+                opcoes_conta[conta_selecionada], opcoes_cat[cat_selecionada]
+            )
             st.success("Configuração salva com sucesso!")
