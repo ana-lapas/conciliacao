@@ -89,11 +89,11 @@ def criar_receita_com_baixa(
         },
     }
 
+    # --- PASSO 2: CRIAÇÃO DO EVENTO FINANCEIRO (CONTA A RECEBER) ---
     logger.info(
         f"Iniciando criação de conta a receber para {nome_cliente} - Valor: R$ {valor:.2f}"
     )
 
-    # Chamada HTTP POST para registrar a conta a receber
     resp = requests.post(
         "https://api-v2.contaazul.com/v1/financeiro/eventos-financeiros/contas-a-receber",
         headers={
@@ -102,18 +102,32 @@ def criar_receita_com_baixa(
         },
         json=payload_evento,
     )
-    resp.raise_for_status()   
 
-    # Captura os detalhes do erro 400 retornados pelo Conta Azul
+    # 1. TRATAMENTO DE ERRO PRIMEIRO: Captura o payload e a resposta real da API
     if not resp.ok:
+        erro_detalhado = resp.text
         logger.error(
-            f"Erro {resp.status_code} no POST contas-a-receber: {resp.text}"
+            f"Erro {resp.status_code} no POST contas-a-receber. Resposta da API: {erro_detalhado}"
         )
-        resp.raise_for_status()
-    # A API responde com um número de protocolo (processamento assíncrono no Conta Azul)
+        
+        # Persiste o erro de validação diretamente na tabela de log do banco
+        try:
+            registrar_log_erro(
+                servico="criar_receita_contas_a_receber",
+                status_code=resp.status_code,
+                resposta_erro=erro_detalhado,
+                payload=payload_evento
+            )
+        except Exception as log_err:
+            logger.error(f"Não foi possível gravar o log de erro no DB: {log_err}")
+
+        # Dispara a exceção com a mensagem REAL para a UI do Streamlit conseguir exibir
+        raise Exception(f"Erro no Conta Azul ({resp.status_code}): {erro_detalhado}")
+
+    # 2. SE PASSOU (HTTP 200/201): Obtém o protocolo
     protocolo = resp.json()
     logger.info(
-        f"Evento financeiro registrado. Resposta/Protocolo: {protocolo}"
+        f"Evento financeiro registrado com sucesso. Resposta/Protocolo: {protocolo}"
     )
 
     # --- PASSO 3: RECUPERAÇÃO DA PARCELA GERADA ---
