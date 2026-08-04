@@ -45,22 +45,21 @@ class RetornoReader:
 
     def _processar_detalhe(self, linha, num_linha):
         try:
-            # Mapeamento conforme Manual Bradesco CNAB 400 (Pág 31-32)
-            nosso_numero = linha[70:82].strip()  # Posições 071-082
-            valor_pago = float(linha[253:266]) / 100 # Posições 254-266
-            data_ocorrencia = linha[110:116] # Posições 111-116
-            codigo_ocorrencia = linha[108:110] # Posições 109-110
-            nome_pagador = linha[234:274].strip()
+            # Posições conforme Manual Bradesco Págs. 31-32
+            nosso_numero_raw = linha[70:82].strip()
+            nosso_numero = nosso_numero_raw.lstrip('0')  # Limpa zeros à esquerda (ex: "94851")
+            
+            valor_pago = float(linha[253:266]) / 100     # Posições 254-266
+            data_ocorrencia = linha[110:116]             # DDMMAA (Posições 111-116)
+            codigo_ocorrencia = linha[108:110]           # Posições 109-110
+
             self.registros.append({
                 'linha': num_linha,
                 'nosso_numero': nosso_numero,
                 'valor': valor_pago,
                 'data': datetime.strptime(data_ocorrencia, '%d%m%y').strftime('%Y-%m-%d'),
                 'ocorrencia': codigo_ocorrencia,
-                'nome_pagador': nome_pagador
+                'nome_pagador': None  # No CNAB 400 Retorno, o nome deve ser buscado via De-Para na Remessa
             })
-            
-            logger.debug(f"Linha {num_linha} OK: N/N {nosso_numero} | Valor: {valor_pago}")
-            
         except (ValueError, IndexError) as e:
-            logger.warning(f"Falha ao processar linha {num_linha}: dados corrompidos. Erro: {e}")
+            logger.warning(f"Falha ao processar linha {num_linha}: {e}")

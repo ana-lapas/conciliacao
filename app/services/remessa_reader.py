@@ -32,20 +32,15 @@ class RemessaReader:
 
     def _processar_mensagem(self, linha):
         """
-        Extrai as 4 mensagens do registro tipo 2 e o nosso número.
-        Layout CNAB 400 – registro tipo 2:
-          Posições 002 a 081 → mensagem 1
-          Posições 082 a 161 → mensagem 2
-          Posições 162 a 241 → mensagem 3
-          Posições 242 a 321 → mensagem 4
-          Posições 383 a 394 → nosso número (com dígito)
+        Extrai as 4 mensagens do registro tipo 2 e o nosso número (posições 383 a 394).
         """
+        nosso_numero_raw = linha[382:394].strip()
         return {
-            "nosso_numero": linha[382:394].strip(),
-            "mensagem1": linha[2:82].strip(),
-            "mensagem2": linha[82:162].strip(),
-            "mensagem3": linha[162:242].strip(),
-            "mensagem4": linha[242:322].strip(),
+            "nosso_numero": nosso_numero_raw.lstrip('0') if nosso_numero_raw else "",
+            "mensagem1": linha[1:81].strip(),
+            "mensagem2": linha[81:161].strip(),
+            "mensagem3": linha[161:241].strip(),
+            "mensagem4": linha[241:321].strip(),
         }
 
     def processar(self):
@@ -77,21 +72,32 @@ class RemessaReader:
     def _processar_registro_tipo_1(self, linha, num_linha):
         """Processa e valida internamente um registro do tipo 1."""
         try:
-            nosso_numero = self._extrair_campo(linha, *self.LAYOUT["nosso_numero"])
+            # Extrai e limpa os zeros à esquerda do Nosso Número (Pág. 16)
+            nosso_numero_raw = self._extrair_campo(linha, *self.LAYOUT["nosso_numero"])
+            nosso_numero = nosso_numero_raw.lstrip('0') if nosso_numero_raw else ""
+
+            # Conversão de Valor (Pág. 9 - posições 127 a 139)
             valor_raw = self._extrair_campo(linha, *self.LAYOUT["valor_titulo"])
             valor_processado = float(valor_raw) / 100
+
+            # Formatação de Data de Vencimento DDMMAA (Pág. 9 - posições 121 a 126)
             data_raw = self._extrair_campo(linha, *self.LAYOUT["data_vencimento"])
             data_formatada = datetime.strptime(data_raw, '%d%m%y').strftime('%Y-%m-%d')
-            # Normalização do CPF/CNPJ (preserva zeros à esquerda)
+
+            # Normalização do CPF/CNPJ
             cpf_raw = self._extrair_campo(linha, *self.LAYOUT["cpf_pagador"])
             cpf = None
             if cpf_raw and cpf_raw.isdigit():
-                if len(cpf_raw) == 11 or len(cpf_raw) == 14:
+                if len(cpf_raw) in (11, 14):
                     cpf = cpf_raw
+
+            # Normalização do Nome do Pagador (Pág. 9 - posições 235 a 274)
+            nome_raw = self._extrair_campo(linha, *self.LAYOUT["nome_pagador"])
+            nome_pagador = " ".join(nome_raw.upper().split()) if nome_raw else ""
 
             registro = {
                 "nosso_numero": nosso_numero,
-                "nome_pagador": self._extrair_campo(linha, *self.LAYOUT["nome_pagador"]),
+                "nome_pagador": nome_pagador,
                 "cpf": cpf,
                 "valor": valor_processado,
                 "vencimento": data_formatada,
@@ -99,12 +105,11 @@ class RemessaReader:
             }
             self.registros.append(registro)
             
-            # Log de acompanhamento para cada registro processado com sucesso
-            logging.debug(f"Linha {num_linha}: Processado pagador {registro['nome_pagador']}")
+            logging.debug(f"Linha {num_linha}: Processado pagador {registro['nome_pagador']} | N/N: {nosso_numero}")
             
-        except ValueError:
-            msg_erro = f"Linha {num_linha}: Erro ao converter valor '{valor_raw}'."
-            logging.warning(msg_erro) # Log como aviso
+        except ValueError as e:
+            msg_erro = f"Linha {num_linha}: Erro ao processar dados da linha. Detalhe: {e}"
+            logging.warning(msg_erro)
             self.erros.append(msg_erro)
             
     def carregar_remessa(caminho_rem):
