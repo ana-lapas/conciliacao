@@ -22,11 +22,10 @@ from app.services.conta_azul_utils import (
     obter_ou_criar_contato,
     traduzir_erro_para_usuario,
 )
-from app.services.matcher import conciliar_retorno    # Motor que cruza pagamentos com a API da Sofia
 from app.services.remessa_sync import sincronizar_remessa   # Lógica que lê o arquivo .rem e salva no banco
 from app.services.retorno_sync import sincronizar_retorno   # Lógica que lê o arquivo .ret e salva no banco
 from app.services.sofia_api import SofiaAPI                 # Cliente HTTP para a API escolar Sofia
-
+from app.services.matcher import conciliar_retorno  # Regras de negócio para cruzar dados e gerar conciliaçõess
 # -----------------------------------------------------------------------------
 # 1. CONFIGURAÇÕES INICIAIS E BANCO DE DADOS
 # -----------------------------------------------------------------------------
@@ -113,7 +112,11 @@ with tab1:
         "Pasta para salvar os arquivos (caminho completo no computador):",
         value=os.path.expanduser("~/documentos_recebidos"),
     )
-
+    if st.button("Sincronizar alunos (cache)"):
+        with st.spinner("Sincronizando..."):
+            from app.services.cache_sync import sync_students
+            sync_students()
+        st.success("Cache de alunos atualizado!")
     # Componentes de Upload (Desacoplados: permite subir .ret, .rem ou ambos)
     col1, col2 = st.columns(2)
     with col1:
@@ -154,11 +157,9 @@ with tab1:
                     with st.spinner("Salvando e importando retorno(s)..."):
                         for ret_file in ret_files:
                             caminho = os.path.join(pasta_destino, ret_file.name)
-                            # Grava o arquivo físico em disco
                             with open(caminho, "wb") as f:
                                 f.write(ret_file.getbuffer())
                             arquivos_salvos.append(caminho)
-                            # Chama o serviço que faz o parse do arquivo CNAB e salva no PostgreSQL
                             sincronizar_retorno(caminho)
                         st.success(f"✅ {len(ret_files)} arquivo(s) de retorno importado(s).")
                 except Exception as e:
@@ -170,11 +171,9 @@ with tab1:
                     with st.spinner("Salvando e importando remessa(s)..."):
                         for rem_file in rem_files:
                             caminho = os.path.join(pasta_destino, rem_file.name)
-                            # Grava o arquivo físico em disco
                             with open(caminho, "wb") as f:
                                 f.write(rem_file.getbuffer())
                             arquivos_salvos.append(caminho)
-                            # Chama o serviço que lê os dados de cobrança da remessa e salva no banco
                             sincronizar_remessa(caminho)
                         st.success(f"✅ {len(rem_files)} arquivo(s) de remessa importado(s).")
                 except Exception as e:
@@ -190,7 +189,6 @@ with tab1:
                         os.getenv("SOFIA_SENHA"),
                     )
                     api.autenticar()
-                    # Compara as entradas do banco com os alunos cadastrados na API Sofia
                     conciliar_retorno(api)
                     st.success("🚀 Conciliação concluída! Verifique a aba de Revisão Manual.")
             except Exception as e:
@@ -198,6 +196,74 @@ with tab1:
 
             st.info(f"📁 Arquivos salvos localmente em: {pasta_destino}")
 
+# --- EXIBIÇÃO DOS DADOS PROCESSADOS NA TELA (RETORNO E REMESSA) ---
+            st.divider()
+            st.subheader("📊 Dados Extraídos dos Arquivos Processados")
+
+            with engine.connect() as conn:
+                # Se arquivos de retorno foram enviados, exibe os dados lidos da tabela 'retorno'
+                if ret_files:
+                    st.markdown("### 📥 Registros do Arquivo de Retorno (.ret)")
+                    df_retorno = pd.read_sql(
+                        text("SELECT id, nosso_numero, dac, valor_pago, data_pagamento, status FROM retorno ORDER BY id DESC LIMIT 100"),
+                        conn
+                    )
+                    if not df_retorno.empty:
+                        st.dataframe(df_retorno, width="stretch", hide_index=True)
+                    else:
+                        st.info("Nenhum registro de retorno encontrado no banco.")
+
+                # Se arquivos de remessa foram enviados, exibe os dados e mensagens da remessa
+                if rem_files:
+                    st.markdown("### 📤 Registros e Mensagens do Arquivo de Remessa (.rem)")
+                    df_remessa = pd.read_sql(
+                        text("""
+                            SELECT r.id, r.nosso_numero, r.dac, r.nome_pagador, r.valor, r.data_vencimento, 
+                                   m.mensagem1, m.mensagem2, m.mensagem3, m.mensagem4
+                            FROM remessa r
+                            LEFT JOIN remessa_mensagem m ON m.nosso_numero = r.nosso_numero
+                            ORDER BY r.id DESC LIMIT 100
+                        """),
+                        conn
+                    )
+                    if not df_remessa.empty:
+                        st.dataframe(df_remessa, width="stretch", hide_index=True)
+                    else:
+                        st.info("Nenhum registro de remessa encontrado no banco.")
+
+                # --- NOVA TABELA: CRUZAMENTO / MATCH POR NOSSO NÚMERO ---
+                st.markdown("### 🔗 Cruzamento de Pagamentos e Alunos (Match por Nosso Número)")
+                df_match = pd.read_sql(
+                    text("""
+                        SELECT 
+                            pm.id AS match_id,
+                            r.nosso_numero,
+                            r.valor_pago,
+                            r.data_pagamento,
+                            pm.nome_responsavel,
+                            pm.nome_aluno,
+                            pm.status AS status_match,
+                            -- Verificações de existência
+                            CASE WHEN rem.id IS NOT NULL THEN '✔️' ELSE '❌' END AS "Tem Remessa",
+                            CASE WHEN r.id IS NOT NULL THEN '✔️' ELSE '❌' END AS "Tem Retorno",
+                            CASE WHEN pm.student_id IS NOT NULL THEN '✔️' ELSE '❌' END AS "Tem Sophia",
+                            CASE 
+                                WHEN rem.id IS NOT NULL AND pm.student_id IS NOT NULL THEN '✅ MATCH COMPLETO'
+                                WHEN rem.id IS NOT NULL THEN '⚠️ Pendente Sophia'
+                                WHEN pm.student_id IS NOT NULL THEN '⚠️ Pendente Remessa'
+                                ELSE '❌ Dados insuficientes'
+                            END AS "Status Conciliação"
+                        FROM payment_match pm
+                        JOIN retorno r ON r.id = pm.retorno_id
+                        LEFT JOIN remessa rem ON rem.nosso_numero = r.nosso_numero
+                        ORDER BY pm.id DESC LIMIT 100
+                    """),
+                    conn
+                )
+                if not df_match.empty:
+                    st.dataframe(df_match, width="stretch", hide_index=True)
+                else:
+                    st.info("Nenhum cruzamento de pagamento encontrado ainda. Processe um arquivo para gerar o match.")
 # =============================================================================
 # ABA 2: REVISÃO MANUAL DE PAGAMENTOS
 # =============================================================================
@@ -665,14 +731,10 @@ with tab4:
             definir_configuracao(id_conta, id_cat)
             st.toast("✅ Configuração padrão do Conta Azul salva no banco com sucesso!", icon="💾")
 
-# =============================================================================
-# ABA 5: CONSULTA EM PRODUÇÃO API SOFIA (Alunos, Lançamentos e Boletos)
-# =============================================================================
 with tab_sofia:
     st.header("🔍 Teste e Inspeção Completa: Alunos, Lançamentos e Boletos")
     st.markdown("Inspecione todos os campos retornados pela API do Sofia de forma detalhada.")
 
-    # Garante o logger local se não existir
     logger_tab = logging.getLogger("sofia_tab")
 
     base_url_sofia = os.getenv("SOFIA_BASE_URL", "")
@@ -681,6 +743,14 @@ with tab_sofia:
     senha_sofia = os.getenv("SOFIA_SENHA", "")
 
     st.info(f"Utilizando Tenant: **{tenant_sofia}** | URL: **{base_url_sofia}**")
+
+    import json
+
+    def serialize_value(val):
+        """Converte listas/dicionários em string JSON para exibição no DataFrame."""
+        if isinstance(val, (list, dict)):
+            return json.dumps(val, ensure_ascii=False)
+        return val
 
     if st.button("Consultar Todos os Dados Detalhados", type="primary"):
         if not all([base_url_sofia, tenant_sofia, usuario_sofia, senha_sofia]):
@@ -691,14 +761,14 @@ with tab_sofia:
                     api = SofiaAPI(base_url_sofia, tenant_sofia, usuario_sofia, senha_sofia)
                     api.autenticar()
 
-                    # 1. Busca Alunos (exibindo todos os campos)
+                    # 1. Busca Alunos
                     alunos = api.listar_alunos(pagina=1, tamanho=50)
                     st.subheader(f"1. Alunos Cadastrados ({len(alunos) if isinstance(alunos, list) else 0})")
                     
                     if alunos and isinstance(alunos, list):
-                        # Mostra o DataFrame completo de alunos
                         df_alunos = pd.DataFrame(alunos)
-                        st.dataframe(df_alunos, use_container_width=True)
+                        df_alunos = df_alunos.map(serialize_value)   # <-- formata objetos complexos
+                        st.dataframe(df_alunos, width="stretch")
 
                         # 2. Varredura para coletar Lançamentos e Boletos completos
                         todos_lancamentos = []
@@ -708,25 +778,23 @@ with tab_sofia:
                         total_alunos = len(alunos)
 
                         for i, aluno in enumerate(alunos):
+                            # CORREÇÃO: usar 'codigo' que é o campo original do Sophia
                             id_aluno = aluno.get("codigo")
                             nome_aluno = aluno.get("nome")
                             if not id_aluno:
                                 continue
 
                             try:
-                                # Busca Lançamentos
                                 lancamentos = api.obter_lancamentos(id_aluno)
                                 if isinstance(lancamentos, list):
                                     for lanc in lancamentos:
-                                        # Injeta dados de referência do aluno no lançamento
                                         lanc_completo = {
                                             "id_aluno": id_aluno,
                                             "aluno_nome": nome_aluno,
-                                            **lanc  # Despeja todas as chaves do lançamento contábil
+                                            **lanc
                                         }
                                         todos_lancamentos.append(lanc_completo)
 
-                                        # Busca Boleto vinculado
                                         codigo_boleto = lanc.get("codigoBoleto")
                                         if codigo_boleto:
                                             try:
@@ -747,25 +815,27 @@ with tab_sofia:
                                                     }
                                                 todos_boletos.append(bol_dict)
                                             except Exception as bol_err:
-                                                logger_tab.warning(f"Erro ao buscar boleto {codigo_boleto} para aluno {id_aluno}: {bol_err}")
+                                                logger_tab.debug(f"Boleto {codigo_boleto} indisponível para aluno {id_aluno}: {bol_err}")
                             except Exception as l_err:
                                 logger_tab.warning(f"Erro ao buscar lançamentos para aluno {id_aluno}: {l_err}")
 
                             progresso.progress((i + 1) / total_alunos)
 
-                        # 3. Exibe Lançamentos Contábeis Detalhados (Todos os campos)
+                        # 3. Exibe Lançamentos
                         st.subheader(f"2. Lançamentos Contábeis ({len(todos_lancamentos)})")
                         if todos_lancamentos:
                             df_lanc = pd.DataFrame(todos_lancamentos)
-                            st.dataframe(df_lanc, use_container_width=True)
+                            df_lanc = df_lanc.map(serialize_value)
+                            st.dataframe(df_lanc, width="stretch")
                         else:
                             st.info("Nenhum lançamento retornado para os alunos listados.")
 
-                        # 4. Exibe Boletos Detalhados (Todos os campos)
-                        st.subheader(f"3. Detalhes dos Boletos Vinculados ({len(todos_boletos)})")
+                        # 4. Exibe Boletos
+                        st.subheader(f"3. Detalhes dos Boletos Vinculados com Sucesso ({len(todos_boletos)})")
                         if todos_boletos:
                             df_bol = pd.DataFrame(todos_boletos)
-                            st.dataframe(df_bol, use_container_width=True)
+                            df_bol = df_bol.map(serialize_value)
+                            st.dataframe(df_bol, width="stretch")
                         else:
                             st.info("Nenhum boleto detalhado retornado para os lançamentos encontrados.")
 

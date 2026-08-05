@@ -1,6 +1,7 @@
 import logging
 from datetime import datetime
 from app.services.remessa_reader import RemessaReader
+import re
 
 # Configuração do Logger
 logging.basicConfig(
@@ -45,21 +46,25 @@ class RetornoReader:
 
     def _processar_detalhe(self, linha, num_linha):
         try:
-            # Posições conforme Manual Bradesco Págs. 31-32
-            nosso_numero_raw = linha[70:82].strip()
-            nosso_numero = nosso_numero_raw.lstrip('0')  # Limpa zeros à esquerda (ex: "94851")
-            # DAC do Nosso Número: Posição 83 (Índice Python 82:83)
-            dac = linha[82:83].strip()
+            # 1. Nosso Número: 11 dígitos (posições 071 a 081)
+            nosso_numero = linha[70:81].strip()
+            # 2. DAC: posição 082
+            dac = linha[81:82].strip()
 
-            # Código de Ocorrência: Posições 109 a 110 (Índice Python 108:110)
+            # 3. Código de Ocorrência (posições 109 a 110)
             codigo_ocorrencia = linha[108:110].strip()
 
-            # Data da Ocorrência (Liquidação): Posições 111 a 116 - DDMMAA (Índice Python 109:115)
-            data_ocorrencia_str = linha[109:115].strip()
-            data_ocorrencia = datetime.strptime(data_ocorrencia_str, '%d%m%y').strftime('%Y-%m-%d')
+            # 4. Data da Ocorrência (posições 111 a 116)
+            data_str = linha[110:116].strip()
+            if data_str == '' or data_str == '000000':
+                raise ValueError("Data de ocorrência vazia ou zerada")
+            data_ocorrencia = datetime.strptime(data_str, '%d%m%y').strftime('%Y-%m-%d')
 
-            # Valor Pago: Posições 254 a 266 (Índice Python 253:266)
+            # 5. Valor Pago (posições 254 a 266)
             valor_pago = float(linha[253:266]) / 100
+
+            # 6. Nome do Pagador (posições 235 a 274)
+            nome_pagador = linha[234:274].strip()
 
             self.registros.append({
                 'linha': num_linha,
@@ -68,8 +73,7 @@ class RetornoReader:
                 'valor': valor_pago,
                 'data': data_ocorrencia,
                 'ocorrencia': codigo_ocorrencia,
-                'nome_pagador': None  # No CNAB 400 Retorno, o nome é obtido via De-Para com a Remessa
+                'nome_pagador': nome_pagador
             })
-            
-        except (ValueError, IndexError) as e:
-            logger.warning(f"Falha ao processar linha de detalhe {num_linha}: {e}")
+        except Exception as e:
+            logger.warning(f"Falha ao processar linha {num_linha}: {e}")

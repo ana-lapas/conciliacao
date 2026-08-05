@@ -37,13 +37,12 @@ class RemessaReader:
         """
         # Posições 383 a 393: Nosso Número (11 posições)[cite: 1]
         nosso_numero_raw = linha[382:393].strip()
-        nosso_numero = nosso_numero_raw.lstrip('0') if nosso_numero_raw else ""
         
         # Posição 394: DAC do Nosso Número (1 posição - numérico ou 'P')[cite: 1]
         dac = linha[393:394].strip()
 
         return {
-            "nosso_numero": nosso_numero,
+            "nosso_numero": nosso_numero_raw,
             "dac": dac,
             "mensagem1": linha[1:81].strip(),
             "mensagem2": linha[81:161].strip(),
@@ -80,18 +79,18 @@ class RemessaReader:
     def _processar_registro_tipo_1(self, linha, num_linha):
         """Processa e valida internamente um registro do tipo 1."""
         try:
-            # Extração correta do Nosso Número sem misturar com o DAC e removendo zeros à esquerda
+            # Extração do Nosso Número (11 dígitos) e DAC (1 dígito)
             nosso_numero_raw = self._extrair_campo(linha, *self.LAYOUT["nosso_numero"])
             dac_raw = self._extrair_campo(linha, *self.LAYOUT["dac_nosso_numero"])
             
-            # Padronização limpa para bater com o arquivo de retorno
-            nosso_numero = nosso_numero_raw.lstrip('0') if nosso_numero_raw else ""
+            # ← ADICIONE ESTA LINHA (preserva zeros à esquerda)
+            nosso_numero = nosso_numero_raw
 
-            # Conversão de Valor (Posições 127 a 139)[cite: 1]
+            # Conversão de Valor (Posições 127 a 139)
             valor_raw = self._extrair_campo(linha, *self.LAYOUT["valor_titulo"])
             valor_processado = float(valor_raw) / 100
 
-            # Formatação de Data de Vencimento DDMMAA (Posições 121 a 126)[cite: 1]
+            # Formatação de Data de Vencimento DDMMAA (Posições 121 a 126)
             data_raw = self._extrair_campo(linha, *self.LAYOUT["data_vencimento"])
             data_formatada = datetime.strptime(data_raw, '%d%m%y').strftime('%Y-%m-%d')
 
@@ -102,12 +101,12 @@ class RemessaReader:
                 if len(cpf_raw) in (11, 14):
                     cpf = cpf_raw
 
-            # Normalização do Nome do Pagador (Posições 235 a 274)[cite: 1]
+            # Normalização do Nome do Pagador (Posições 235 a 274)
             nome_raw = self._extrair_campo(linha, *self.LAYOUT["nome_pagador"])
             nome_pagador = " ".join(nome_raw.upper().split()) if nome_raw else ""
 
             registro = {
-                "nosso_numero": nosso_numero,
+                "nosso_numero": nosso_numero,   # ← agora funciona
                 "dac": dac_raw,
                 "nome_pagador": nome_pagador,
                 "cpf": cpf,
