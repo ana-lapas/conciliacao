@@ -669,39 +669,45 @@ with tab4:
 # ABA 5: CONSULTA EM PRODUÇÃO API SOFIA (Alunos, Lançamentos e Boletos)
 # =============================================================================
 with tab_sofia:
-    st.header("🔍 Teste e Inspeção de Lançamentos e Boletos via API Sofia")
-    st.markdown("Consulte em tempo real os dados de **Alunos**, **Lançamentos Contábeis** e **Boletos** diretamente da API do Sofia.")
+    st.header("🔍 Teste e Inspeção Completa: Alunos, Lançamentos e Boletos")
+    st.markdown("Inspecione todos os campos retornados pela API do Sofia de forma detalhada.")
 
-    # Conecta automaticamente usando as variáveis de ambiente carregadas
+    # Garante o logger local se não existir
+    logger_tab = logging.getLogger("sofia_tab")
+
     base_url_sofia = os.getenv("SOFIA_BASE_URL", "")
     tenant_sofia = os.getenv("SOFIA_TENANT", "")
     usuario_sofia = os.getenv("SOFIA_USUARIO", "")
     senha_sofia = os.getenv("SOFIA_SENHA", "")
 
-    # Correção aplicada aqui: Uso correto de f-string
     st.info(f"Utilizando Tenant: **{tenant_sofia}** | URL: **{base_url_sofia}**")
 
-    if st.button("Consultar Dados do Sofia", type="primary"):
+    if st.button("Consultar Todos os Dados Detalhados", type="primary"):
         if not all([base_url_sofia, tenant_sofia, usuario_sofia, senha_sofia]):
             st.error("As credenciais do Sofia não estão totalmente definidas nas variáveis de ambiente (.env).")
         else:
-            with st.spinner("Autenticando e buscando dados no Sofia..."):
+            with st.spinner("Autenticando e extraindo todas as informações do Sofia..."):
                 try:
                     api = SofiaAPI(base_url_sofia, tenant_sofia, usuario_sofia, senha_sofia)
                     api.autenticar()
 
-                    # 1. Busca Alunos
+                    # 1. Busca Alunos (exibindo todos os campos)
                     alunos = api.listar_alunos(pagina=1, tamanho=50)
-                    st.subheader(f"1. Alunos Retornados (Total: {len(alunos) if isinstance(alunos, list) else 'N/A'})")
+                    st.subheader(f"1. Alunos Cadastrados ({len(alunos) if isinstance(alunos, list) else 0})")
                     
                     if alunos and isinstance(alunos, list):
-                        st.dataframe(pd.DataFrame(alunos)[["codigo", "nome", "email"]])
+                        # Mostra o DataFrame completo de alunos
+                        df_alunos = pd.DataFrame(alunos)
+                        st.dataframe(df_alunos, use_container_width=True)
 
-                        # 2. Varre os lançamentos e boletos para cada aluno listado
+                        # 2. Varredura para coletar Lançamentos e Boletos completos
                         todos_lancamentos = []
                         todos_boletos = []
 
-                        for aluno in alunos:
+                        progresso = st.progress(0)
+                        total_alunos = len(alunos)
+
+                        for i, aluno in enumerate(alunos):
                             id_aluno = aluno.get("codigo")
                             nome_aluno = aluno.get("nome")
                             if not id_aluno:
@@ -712,37 +718,56 @@ with tab_sofia:
                                 lancamentos = api.obter_lancamentos(id_aluno)
                                 if isinstance(lancamentos, list):
                                     for lanc in lancamentos:
-                                        lanc["aluno_nome"] = nome_aluno
-                                        lanc["id_aluno"] = id_aluno
-                                        todos_lancamentos.append(lanc)
+                                        # Injeta dados de referência do aluno no lançamento
+                                        lanc_completo = {
+                                            "id_aluno": id_aluno,
+                                            "aluno_nome": nome_aluno,
+                                            **lanc  # Despeja todas as chaves do lançamento contábil
+                                        }
+                                        todos_lancamentos.append(lanc_completo)
 
-                                        # Busca o Boleto vinculado se houver código de boleto
+                                        # Busca Boleto vinculado
                                         codigo_boleto = lanc.get("codigoBoleto")
                                         if codigo_boleto:
                                             try:
                                                 boleto_info = api.obter_boleto(id_aluno, codigo_boleto)
-                                                todos_boletos.append({
-                                                    "id_aluno": id_aluno,
-                                                    "aluno_nome": nome_aluno,
-                                                    "codigo_boleto": codigo_boleto,
-                                                    "dados_boleto": str(boleto_info)
-                                                })
+                                                if isinstance(boleto_info, dict):
+                                                    bol_dict = {
+                                                        "id_aluno": id_aluno,
+                                                        "aluno_nome": nome_aluno,
+                                                        "codigo_boleto": codigo_boleto,
+                                                        **boleto_info
+                                                    }
+                                                else:
+                                                    bol_dict = {
+                                                        "id_aluno": id_aluno,
+                                                        "aluno_nome": nome_aluno,
+                                                        "codigo_boleto": codigo_boleto,
+                                                        "dados_brutos": str(boleto_info)
+                                                    }
+                                                todos_boletos.append(bol_dict)
                                             except Exception as bol_err:
-                                                logger.warning(f"Erro ao buscar boleto {codigo_boleto} para aluno {id_aluno}: {bol_err}")
+                                                logger_tab.warning(f"Erro ao buscar boleto {codigo_boleto} para aluno {id_aluno}: {bol_err}")
                             except Exception as l_err:
-                                logger.warning(f"Erro ao buscar lançamentos para aluno {id_aluno}: {l_err}")
+                                logger_tab.warning(f"Erro ao buscar lançamentos para aluno {id_aluno}: {l_err}")
 
-                        st.subheader(f"2. Lançamentos Contábeis Recuperados ({len(todos_lancamentos)})")
+                            progresso.progress((i + 1) / total_alunos)
+
+                        # 3. Exibe Lançamentos Contábeis Detalhados (Todos os campos)
+                        st.subheader(f"2. Lançamentos Contábeis ({len(todos_lancamentos)})")
                         if todos_lancamentos:
-                            st.dataframe(pd.DataFrame(todos_lancamentos))
+                            df_lanc = pd.DataFrame(todos_lancamentos)
+                            st.dataframe(df_lanc, use_container_width=True)
                         else:
-                            st.info("Nenhum lançamento encontrado para os alunos listados.")
+                            st.info("Nenhum lançamento retornado para os alunos listados.")
 
+                        # 4. Exibe Boletos Detalhados (Todos os campos)
                         st.subheader(f"3. Detalhes dos Boletos Vinculados ({len(todos_boletos)})")
                         if todos_boletos:
-                            st.dataframe(pd.DataFrame(todos_boletos))
+                            df_bol = pd.DataFrame(todos_boletos)
+                            st.dataframe(df_bol, use_container_width=True)
                         else:
-                            st.info("Nenhum boleto detalhado encontrado.")
+                            st.info("Nenhum boleto detalhado retornado para os lançamentos encontrados.")
 
                     else:
                         st.warning("Nenhum aluno retornado pela API.")
