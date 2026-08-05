@@ -678,7 +678,8 @@ with tab_sofia:
     usuario_sofia = os.getenv("SOFIA_USUARIO", "")
     senha_sofia = os.getenv("SOFIA_SENHA", "")
 
-    st.info( utilizando Tenant: **{tenant_sofia}** | URL: **{base_url_sofia}** )
+    # Correção aplicada aqui: Uso correto de f-string
+    st.info(f"Utilizando Tenant: **{tenant_sofia}** | URL: **{base_url_sofia}**")
 
     if st.button("Consultar Dados do Sofia", type="primary"):
         if not all([base_url_sofia, tenant_sofia, usuario_sofia, senha_sofia]):
