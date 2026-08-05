@@ -95,13 +95,13 @@ st.divider()
 # -----------------------------------------------------------------------------
 # 3. ESTRUTURA DE ABAS DA APLICAÇÃO
 # -----------------------------------------------------------------------------
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab_sofia = st.tabs([
     "📂 Processar Arquivos",
     "🔍 Revisão Manual",
     "📋 Conciliações Prontas",
     "💳 Conta Azul",
+    "🔍 Consulta Sofia & Boletos",
 ])
-
 # =============================================================================
 # ABA 1: UPLOAD DE ARQUIVOS E CONCILIAÇÃO AUTOMÁTICA
 # =============================================================================
@@ -664,3 +664,88 @@ with tab4:
             
             definir_configuracao(id_conta, id_cat)
             st.toast("✅ Configuração padrão do Conta Azul salva no banco com sucesso!", icon="💾")
+
+# =============================================================================
+# ABA 5: CONSULTA EM PRODUÇÃO API SOFIA (Alunos, Lançamentos e Boletos)
+# =============================================================================
+with tab_sofia:
+    st.header("🔍 Teste e Inspeção de Lançamentos e Boletos via API Sofia")
+    st.markdown("Consulte em tempo real os dados de **Alunos**, **Lançamentos Contábeis** e **Boletos** diretamente da API do Sofia.")
+
+    # Conecta automaticamente usando as variáveis de ambiente carregadas
+    base_url_sofia = os.getenv("SOFIA_BASE_URL", "")
+    tenant_sofia = os.getenv("SOFIA_TENANT", "")
+    usuario_sofia = os.getenv("SOFIA_USUARIO", "")
+    senha_sofia = os.getenv("SOFIA_SENHA", "")
+
+    st.info( utilizando Tenant: **{tenant_sofia}** | URL: **{base_url_sofia}** )
+
+    if st.button("Consultar Dados do Sofia", type="primary"):
+        if not all([base_url_sofia, tenant_sofia, usuario_sofia, senha_sofia]):
+            st.error("As credenciais do Sofia não estão totalmente definidas nas variáveis de ambiente (.env).")
+        else:
+            with st.spinner("Autenticando e buscando dados no Sofia..."):
+                try:
+                    api = SofiaAPI(base_url_sofia, tenant_sofia, usuario_sofia, senha_sofia)
+                    api.autenticar()
+
+                    # 1. Busca Alunos
+                    alunos = api.listar_alunos(pagina=1, tamanho=50)
+                    st.subheader(f"1. Alunos Retornados (Total: {len(alunos) if isinstance(alunos, list) else 'N/A'})")
+                    
+                    if alunos and isinstance(alunos, list):
+                        st.dataframe(pd.DataFrame(alunos)[["codigo", "nome", "email"]])
+
+                        # 2. Varre os lançamentos e boletos para cada aluno listado
+                        todos_lancamentos = []
+                        todos_boletos = []
+
+                        for aluno in alunos:
+                            id_aluno = aluno.get("codigo")
+                            nome_aluno = aluno.get("nome")
+                            if not id_aluno:
+                                continue
+
+                            try:
+                                # Busca Lançamentos
+                                lancamentos = api.obter_lancamentos(id_aluno)
+                                if isinstance(lancamentos, list):
+                                    for lanc in lancamentos:
+                                        lanc["aluno_nome"] = nome_aluno
+                                        lanc["id_aluno"] = id_aluno
+                                        todos_lancamentos.append(lanc)
+
+                                        # Busca o Boleto vinculado se houver código de boleto
+                                        codigo_boleto = lanc.get("codigoBoleto")
+                                        if codigo_boleto:
+                                            try:
+                                                boleto_info = api.obter_boleto(id_aluno, codigo_boleto)
+                                                todos_boletos.append({
+                                                    "id_aluno": id_aluno,
+                                                    "aluno_nome": nome_aluno,
+                                                    "codigo_boleto": codigo_boleto,
+                                                    "dados_boleto": str(boleto_info)
+                                                })
+                                            except Exception as bol_err:
+                                                logger.warning(f"Erro ao buscar boleto {codigo_boleto} para aluno {id_aluno}: {bol_err}")
+                            except Exception as l_err:
+                                logger.warning(f"Erro ao buscar lançamentos para aluno {id_aluno}: {l_err}")
+
+                        st.subheader(f"2. Lançamentos Contábeis Recuperados ({len(todos_lancamentos)})")
+                        if todos_lancamentos:
+                            st.dataframe(pd.DataFrame(todos_lancamentos))
+                        else:
+                            st.info("Nenhum lançamento encontrado para os alunos listados.")
+
+                        st.subheader(f"3. Detalhes dos Boletos Vinculados ({len(todos_boletos)})")
+                        if todos_boletos:
+                            st.dataframe(pd.DataFrame(todos_boletos))
+                        else:
+                            st.info("Nenhum boleto detalhado encontrado.")
+
+                    else:
+                        st.warning("Nenhum aluno retornado pela API.")
+
+                except Exception as e:
+                    st.error(f"Erro ao comunicar com a API do Sofia: {e}")
+                    st.exception(e)

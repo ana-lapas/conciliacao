@@ -220,4 +220,11 @@ class SofiaAPI:
         response = self._request_with_retry("GET", f"alunos/{id_aluno}/Lancamentos")
         return response.json()
 
+    def obter_boleto(self, id_aluno: int, codigo_boleto: int) -> dict:
+        """
+        Retorna os detalhes de um boleto específico de um aluno pelo código do boleto.
+        Endpoint: /alunos/{idAluno}/Boletos/{codigoBoleto}
+        """
+        response = self._request_with_retry("GET", f"alunos/{id_aluno}/Boletos/{codigo_boleto}")
+        return response.json()
     
